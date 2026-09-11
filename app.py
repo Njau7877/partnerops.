@@ -56,6 +56,7 @@ import hashlib
 import secrets
 import sqlite3
 import logging
+from difflib import SequenceMatcher
 from datetime import datetime, date, timedelta, timezone
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
@@ -63,16 +64,47 @@ from typing import Dict, Any, List, Optional
 import pandas as pd
 import streamlit as st
 
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
 
 # ============================================================
 # 1. APPLICATION CONFIGURATION
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.0 Commercial Control"
+APP_VERSION = "5.1.1 Hardened Universal Ingestion"
 
 DB_FILE = os.getenv("PARTNEROPS_DB", "partnerops.db")
-BASE_URL = os.getenv("PARTNEROPS_BASE_URL", "").rstrip("/")
+BASE_URL = os.getenv(
+    "PARTNEROPS_BASE_URL",
+    "https://partnerops-rpeqjfrqr4cujvyazrvbvs.streamlit.app",
+).rstrip("/")
+
+MAX_UPLOAD_MB = int(os.getenv("PARTNEROPS_MAX_UPLOAD_MB", "25"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+SUPPORTED_UPLOAD_TYPES = [
+    "csv", "xlsx", "xls", "json", "txt",
+    "pdf", "docx", "png", "jpg", "jpeg",
+]
 
 ACCESS_SECRET = os.getenv(
     "PARTNEROPS_ACCESS_SECRET",
@@ -434,8 +466,10 @@ def has_permission(permission):
 # ============================================================
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
@@ -825,8 +859,13 @@ def create_access_link(
     days=7,
     created_by=None,
 ):
+    """Create an opaque, server-resolved customer access credential."""
     if not tenant_industry_enabled(tenant_id, industry):
         raise ValueError("Industry is not entitled for this customer.")
+
+    days = int(days)
+    if days < 1 or days > 365:
+        raise ValueError("Access-link validity must be between 1 and 365 days.")
 
     token = secrets.token_urlsafe(48)
     token_hash = hash_access_token(token)
@@ -846,7 +885,6 @@ def create_access_link(
             industry,
             token_hash,
             expires_at,
-            utc_iso(),
             created_by or st.session_state.get("username"),
         ),
     )
@@ -862,64 +900,71 @@ def create_access_link(
         tenant_id=tenant_id,
     )
 
-    if BASE_URL:
-        return (
-            f"{BASE_URL}/?tenant={tenant_id}"
-            f"&industry={industry}&access={token}"
-        )
-
-    return (
-        f"?tenant={tenant_id}"
-        f"&industry={industry}&access={token}"
-    )
+    base = BASE_URL or ""
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}access={token}"
 
 
-def validate_access_link(tenant_id, industry, token):
-    if not tenant_id or not industry or not token:
-        return False
-
-    if not tenant_exists(tenant_id):
-        return False
-
-    if not tenant_industry_enabled(tenant_id, industry):
-        return False
+def validate_access_token(token):
+    """Resolve an opaque token to its server-side customer scope."""
+    if not token or not isinstance(token, str) or len(token) < 32:
+        return None
 
     token_hash = hash_access_token(token)
 
     rows = db_execute(
         """
-        SELECT *
+        SELECT tenant_id, industry, expires_at
         FROM access_links
-        WHERE tenant_id = ?
-          AND industry = ?
-          AND token_hash = ?
+        WHERE token_hash = ?
           AND active = 1
         ORDER BY link_id DESC
         LIMIT 1
         """,
-        (
-            tenant_id,
-            industry,
-            token_hash,
-        ),
+        (token_hash,),
         fetch=True,
     )
 
     if not rows:
-        return False
+        return None
 
     row = rows[0]
 
     try:
         expires = datetime.fromisoformat(row["expires_at"])
-
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
         if expires < utc_now():
-            return False
-
+            return None
     except Exception:
+        return None
+
+    tenant_id = row["tenant_id"]
+    industry = row["industry"]
+
+    if not tenant_exists(tenant_id):
+        return None
+
+    if not tenant_industry_enabled(tenant_id, industry):
+        return None
+
+    return {
+        "tenant_id": tenant_id,
+        "industry": industry,
+        "expires_at": row["expires_at"],
+    }
+
+
+def validate_access_link(tenant_id, industry, token):
+    """Legacy validation retained for existing old-style links."""
+    scope = validate_access_token(token)
+    if not scope:
         return False
 
-    return True
+    return (
+        hmac.compare_digest(str(scope["tenant_id"]), str(tenant_id))
+        and hmac.compare_digest(str(scope["industry"]), str(industry))
+    )
 
 
 def rotate_customer_links(tenant_id, industry):
@@ -948,45 +993,46 @@ def rotate_customer_links(tenant_id, industry):
 def process_customer_access():
     params = st.query_params
 
-    tenant_id = params.get("tenant")
-    industry = params.get("industry")
     token = params.get("access")
-
-    if isinstance(tenant_id, list):
-        tenant_id = tenant_id[0]
-
-    if isinstance(industry, list):
-        industry = industry[0]
+    legacy_tenant = params.get("tenant")
+    legacy_industry = params.get("industry")
 
     if isinstance(token, list):
         token = token[0]
+    if isinstance(legacy_tenant, list):
+        legacy_tenant = legacy_tenant[0]
+    if isinstance(legacy_industry, list):
+        legacy_industry = legacy_industry[0]
 
-    if tenant_id and industry and token:
-        if validate_access_link(tenant_id, industry, token):
+    # New links: the token alone determines tenant and industry server-side.
+    if token:
+        scope = validate_access_token(token)
+
+        if scope:
             st.session_state.authenticated = True
             st.session_state.access_mode = "customer"
-            st.session_state.tenant_id = tenant_id
-            st.session_state.locked_industry = industry
-            st.session_state.current_industry = industry
+            st.session_state.tenant_id = scope["tenant_id"]
+            st.session_state.locked_industry = scope["industry"]
+            st.session_state.current_industry = scope["industry"]
             st.session_state.role = "Viewer"
             st.session_state.username = "customer_link"
             return True
 
         audit(
             "CUSTOMER_ACCESS_DENIED",
-            "tenant",
-            tenant_id,
-            {"industry": industry},
-            tenant_id=tenant_id,
+            "access_link",
+            "unknown",
+            {"reason": "invalid_or_expired_token"},
             username="customer_link",
         )
 
         st.error(
-            "This customer access link is invalid, inactive, "
-            "expired, or no longer entitled."
+            "This customer access link is invalid, inactive, expired, "
+            "or no longer entitled."
         )
         st.stop()
 
+    # No credential means normal login flow.
     return False
 
 
@@ -1302,36 +1348,135 @@ def clean_column_name(value):
     )
 
 
+def _column_similarity(a, b):
+    a = clean_column_name(a).replace("_", "")
+    b = clean_column_name(b).replace("_", "")
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.92
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def _coerce_numeric_series(series):
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+        .str.replace(r"[^0-9.\-]", "", regex=True)
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
 def normalize_dataframe(df):
+    if df is None:
+        return pd.DataFrame()
+
     df = df.copy()
 
+    if df.empty:
+        return df
+
+    df.dropna(axis=0, how="all", inplace=True)
+    df.dropna(axis=1, how="all", inplace=True)
+
+    original_columns = []
+    seen = {}
+
+    for idx, col in enumerate(df.columns):
+        raw = str(col).strip()
+
+        if not raw or raw.lower().startswith("unnamed"):
+            raw = f"column_{idx + 1}"
+
+        base = clean_column_name(raw)
+        count = seen.get(base, 0)
+        seen[base] = count + 1
+
+        original_columns.append(
+            base if count == 0 else f"{base}_{count + 1}"
+        )
+
+    df.columns = original_columns
+
     rename_map = {}
+    claimed_targets = set()
 
-    cleaned = {
-        col: clean_column_name(col)
-        for col in df.columns
-    }
-
-    df.rename(columns=cleaned, inplace=True)
-
+    # Exact aliases first.
     for canonical, aliases in COLUMN_ALIASES.items():
         if canonical in df.columns:
+            claimed_targets.add(canonical)
             continue
 
-        for alias in aliases:
-            alias = clean_column_name(alias)
+        alias_set = {
+            clean_column_name(alias)
+            for alias in aliases
+        }
 
-            if alias in df.columns:
-                rename_map[alias] = canonical
+        for col in df.columns:
+            if col in rename_map:
+                continue
+
+            if col in alias_set and canonical not in claimed_targets:
+                rename_map[col] = canonical
+                claimed_targets.add(canonical)
                 break
 
     df.rename(columns=rename_map, inplace=True)
+
+    # Conservative fuzzy matching for common human variations.
+    for col in list(df.columns):
+        if col in claimed_targets:
+            continue
+
+        candidates = []
+
+        for canonical, aliases in COLUMN_ALIASES.items():
+            if canonical in df.columns or canonical in claimed_targets:
+                continue
+
+            for alias in [canonical] + aliases:
+                candidates.append(
+                    (_column_similarity(col, alias), canonical)
+                )
+
+        candidates.sort(reverse=True)
+
+        if not candidates:
+            continue
+
+        best_score, best_target = candidates[0]
+        second_score = (
+            candidates[1][0]
+            if len(candidates) > 1
+            else 0.0
+        )
+
+        if (
+            best_score >= 0.88
+            and best_score - second_score >= 0.04
+            and best_target not in df.columns
+            and best_target not in claimed_targets
+        ):
+            df.rename(
+                columns={col: best_target},
+                inplace=True,
+            )
+            claimed_targets.add(best_target)
 
     if "partner" in df.columns:
         df["partner"] = (
             df["partner"]
             .astype(str)
             .str.strip()
+            .replace({"nan": pd.NA, "None": pd.NA})
         )
 
     numeric_columns = [
@@ -1351,10 +1496,7 @@ def normalize_dataframe(df):
 
     for col in numeric_columns:
         if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce",
-            )
+            df[col] = _coerce_numeric_series(df[col])
 
     if "date" in df.columns:
         df["date"] = pd.to_datetime(
@@ -1362,7 +1504,6 @@ def normalize_dataframe(df):
             errors="coerce",
         )
 
-    # Derive useful ratios where source data allows it.
     if (
         "completion_rate" not in df.columns
         and "completed" in df.columns
@@ -2343,7 +2484,7 @@ def get_current_data(industry):
     )
 
 
-def set_current_data(df, industry):
+def set_current_data(df, industry, filename="current_dataset"):
     normalized = normalize_dataframe(df)
 
     quality = quality_check(
@@ -2359,7 +2500,7 @@ def set_current_data(df, industry):
 
     save_dataset(
         normalized,
-        "current_dataset",
+        str(filename)[:255],
         quality["status"],
         industry,
     )
@@ -2985,6 +3126,311 @@ if st.sidebar.button(
 
 
 # ============================================================
+# 26A. UNIVERSAL DATA INGESTION
+# ============================================================
+
+def _read_text_as_table(raw_bytes):
+    text = raw_bytes.decode("utf-8-sig", errors="replace").strip()
+
+    if not text:
+        return pd.DataFrame()
+
+    for sep in [None, ",", "\\t", ";", "|"]:
+        try:
+            if sep is None:
+                candidate = pd.read_csv(
+                    io.StringIO(text),
+                    sep=None,
+                    engine="python",
+                )
+            else:
+                candidate = pd.read_csv(
+                    io.StringIO(text),
+                    sep=sep,
+                )
+
+            if len(candidate.columns) > 1 or len(candidate) > 1:
+                return candidate
+
+        except Exception:
+            continue
+
+    return pd.DataFrame(
+        {"text": text.splitlines()}
+    )
+
+
+def _json_to_dataframe(raw_bytes):
+    obj = json.loads(
+        raw_bytes.decode(
+            "utf-8-sig",
+            errors="replace",
+        )
+    )
+
+    if isinstance(obj, list):
+        return pd.json_normalize(obj)
+
+    if isinstance(obj, dict):
+        for key in (
+            "data",
+            "records",
+            "rows",
+            "items",
+            "results",
+        ):
+            value = obj.get(key)
+
+            if isinstance(value, list):
+                return pd.json_normalize(value)
+
+        return pd.json_normalize(obj)
+
+    raise ValueError(
+        "JSON must contain an object or list of records."
+    )
+
+
+def _pdf_to_dataframe(raw_bytes):
+    if pdfplumber is None:
+        raise RuntimeError(
+            "PDF support is not installed. "
+            "Add pdfplumber to requirements.txt."
+        )
+
+    tables = []
+    text_chunks = []
+
+    with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+        for page in pdf.pages:
+            page_tables = page.extract_tables() or []
+
+            for table in page_tables:
+                if table and len(table) >= 2:
+                    header = table[0]
+                    rows = table[1:]
+
+                    if header:
+                        tables.append(
+                            pd.DataFrame(
+                                rows,
+                                columns=header,
+                            )
+                        )
+
+            page_text = page.extract_text() or ""
+
+            if page_text.strip():
+                text_chunks.append(page_text)
+
+    if tables:
+        return pd.concat(
+            tables,
+            ignore_index=True,
+        )
+
+    if text_chunks:
+        return _read_text_as_table(
+            "\n".join(text_chunks).encode("utf-8")
+        )
+
+    raise ValueError(
+        "No extractable table/text was found in the PDF. "
+        "Scanned PDFs may require OCR before upload."
+    )
+
+
+def _docx_to_dataframe(raw_bytes):
+    if Document is None:
+        raise RuntimeError(
+            "DOCX support is not installed. "
+            "Add python-docx to requirements.txt."
+        )
+
+    document = Document(
+        io.BytesIO(raw_bytes)
+    )
+
+    tables = []
+
+    for table in document.tables:
+        rows = [
+            [
+                cell.text.strip()
+                for cell in row.cells
+            ]
+            for row in table.rows
+        ]
+
+        if len(rows) >= 2 and rows[0]:
+            tables.append(
+                pd.DataFrame(
+                    rows[1:],
+                    columns=rows[0],
+                )
+            )
+
+    if tables:
+        return pd.concat(
+            tables,
+            ignore_index=True,
+        )
+
+    paragraphs = [
+        p.text.strip()
+        for p in document.paragraphs
+        if p.text.strip()
+    ]
+
+    if paragraphs:
+        return _read_text_as_table(
+            "\n".join(paragraphs).encode("utf-8")
+        )
+
+    raise ValueError(
+        "No readable table or text was found in the DOCX."
+    )
+
+
+def _image_to_dataframe(raw_bytes):
+    if Image is None or pytesseract is None:
+        raise RuntimeError(
+            "Image OCR support is not installed. "
+            "Add Pillow, pytesseract and the tesseract-ocr "
+            "system package."
+        )
+
+    image = Image.open(
+        io.BytesIO(raw_bytes)
+    )
+
+    text = pytesseract.image_to_string(
+        image
+    ).strip()
+
+    if not text:
+        raise ValueError(
+            "OCR could not extract readable text from the image."
+        )
+
+    return _read_text_as_table(
+        text.encode("utf-8")
+    )
+
+
+def read_partnerops_upload(upload):
+    """Convert a supported upload into a DataFrame without accepting it."""
+    if upload is None:
+        raise ValueError("No file was supplied.")
+
+    size = getattr(upload, "size", None)
+
+    if size is not None and size > MAX_UPLOAD_BYTES:
+        raise ValueError(
+            f"File is too large. Maximum supported upload "
+            f"is {MAX_UPLOAD_MB} MB."
+        )
+
+    name = str(
+        getattr(upload, "name", "upload")
+    ).strip()
+
+    ext = (
+        name.lower().rsplit(".", 1)[-1]
+        if "." in name
+        else ""
+    )
+
+    if ext not in SUPPORTED_UPLOAD_TYPES:
+        raise ValueError(
+            "Unsupported file type. Supported formats: "
+            + ", ".join(SUPPORTED_UPLOAD_TYPES)
+        )
+
+    raw = upload.getvalue()
+
+    if not raw:
+        raise ValueError(
+            "The uploaded file is empty."
+        )
+
+    if ext == "csv":
+        return pd.read_csv(
+            io.BytesIO(raw)
+        )
+
+    if ext in {"xlsx", "xls"}:
+        workbook = pd.ExcelFile(
+            io.BytesIO(raw)
+        )
+
+        frames = []
+
+        for sheet in workbook.sheet_names:
+            sheet_df = pd.read_excel(
+                workbook,
+                sheet_name=sheet,
+            )
+
+            if not sheet_df.dropna(
+                how="all"
+            ).empty:
+                sheet_df["__source_sheet"] = sheet
+                frames.append(sheet_df)
+
+        if not frames:
+            raise ValueError(
+                "The Excel workbook contains no readable data."
+            )
+
+        return pd.concat(
+            frames,
+            ignore_index=True,
+            sort=False,
+        )
+
+    if ext == "json":
+        return _json_to_dataframe(raw)
+
+    if ext == "txt":
+        return _read_text_as_table(raw)
+
+    if ext == "pdf":
+        return _pdf_to_dataframe(raw)
+
+    if ext == "docx":
+        return _docx_to_dataframe(raw)
+
+    if ext in {"png", "jpg", "jpeg"}:
+        return _image_to_dataframe(raw)
+
+    raise ValueError(
+        "Unable to process the uploaded file."
+    )
+
+
+def ingestion_summary(
+    raw_df,
+    normalized_df,
+    filename,
+):
+    return {
+        "filename": filename,
+        "source_rows": int(len(raw_df)),
+        "source_columns": int(
+            len(raw_df.columns)
+        ),
+        "mapped_columns": int(
+            len(normalized_df.columns)
+        ),
+        "mapped_fields": [
+            c for c in COLUMN_ALIASES
+            if c in normalized_df.columns
+        ],
+    }
+
+
+# ============================================================
 # 27. LOAD + PROCESS DATA
 # ============================================================
 
@@ -3007,27 +3453,56 @@ if quality["status"] == "BLOCKED":
 
     if has_permission("upload"):
         upload = st.file_uploader(
-            "Upload corrected CSV or Excel file",
-            type=["csv", "xlsx", "xls"],
+            "Upload operational data",
+            type=SUPPORTED_UPLOAD_TYPES,
+            help=(
+                f"CSV, Excel, JSON, TXT, PDF, DOCX, PNG or JPG. "
+                f"Maximum {MAX_UPLOAD_MB} MB."
+            ),
         )
 
         if upload:
             try:
-                if upload.name.lower().endswith(".csv"):
-                    uploaded_df = pd.read_csv(upload)
-                else:
-                    uploaded_df = pd.read_excel(upload)
-
-                ok, q = set_current_data(
-                    uploaded_df,
+                uploaded_df = read_partnerops_upload(upload)
+                normalized = normalize_dataframe(uploaded_df)
+                q = quality_check(
+                    normalized,
                     industry,
                 )
 
-                if ok:
-                    st.success(
-                        "Dataset accepted."
-                    )
-                    st.rerun()
+                st.caption(
+                    f"Detected: {upload.name} · "
+                    f"{len(uploaded_df):,} source row(s) · "
+                    f"{len(normalized.columns):,} normalized column(s)"
+                )
+
+                st.dataframe(
+                    normalized.head(20),
+                    use_container_width=True,
+                )
+
+                if q["status"] != "BLOCKED":
+                    if st.button(
+                        "Accept Dataset",
+                        key="blocked_upload_accept",
+                    ):
+                        ok, q2 = set_current_data(
+                            uploaded_df,
+                            industry,
+                            upload.name,
+                        )
+
+                        if ok:
+                            st.success(
+                                "Dataset accepted and saved."
+                            )
+                            st.rerun()
+                        else:
+                            st.error(
+                                "Dataset rejected by quality gate."
+                            )
+                            for issue in q2["issues"]:
+                                st.error(issue)
                 else:
                     st.error(
                         "Dataset rejected by quality gate."
@@ -3904,51 +4379,53 @@ elif page == "Data Quality":
         )
 
         upload = st.file_uploader(
-            "CSV or Excel",
-            type=[
-                "csv",
-                "xlsx",
-                "xls",
-            ],
+            "Upload New Dataset",
+            type=SUPPORTED_UPLOAD_TYPES,
+            help=(
+                f"CSV, Excel, JSON, TXT, PDF, DOCX, PNG or JPG. "
+                f"Maximum {MAX_UPLOAD_MB} MB."
+            ),
         )
 
         if upload:
-
             try:
-                if upload.name.lower().endswith(
-                    ".csv"
-                ):
-                    uploaded_df = pd.read_csv(
-                        upload
-                    )
-                else:
-                    uploaded_df = pd.read_excel(
-                        upload
-                    )
-
-                normalized = normalize_dataframe(
-                    uploaded_df
-                )
-
+                uploaded_df = read_partnerops_upload(upload)
+                normalized = normalize_dataframe(uploaded_df)
                 q = quality_check(
                     normalized,
                     industry,
                 )
 
+                summary = ingestion_summary(
+                    uploaded_df,
+                    normalized,
+                    upload.name,
+                )
+
                 st.write(
                     f"Quality status: **{q['status']}**"
                 )
+                st.caption(
+                    f"{summary['filename']} · "
+                    f"{summary['source_rows']:,} source row(s) · "
+                    f"{summary['mapped_columns']:,} normalized column(s)"
+                )
+
+                st.dataframe(
+                    normalized.head(20),
+                    use_container_width=True,
+                )
 
                 if q["status"] != "BLOCKED":
-
                     if st.button(
                         "Accept Dataset",
                         use_container_width=True,
+                        key="accept_dataset_quality",
                     ):
-
-                        ok, _ = set_current_data(
+                        ok, q2 = set_current_data(
                             uploaded_df,
                             industry,
+                            upload.name,
                         )
 
                         if ok:
@@ -3956,9 +4433,13 @@ elif page == "Data Quality":
                                 "Dataset accepted and loaded."
                             )
                             st.rerun()
-
+                        else:
+                            st.error(
+                                "Dataset rejected by quality gate."
+                            )
+                            for issue in q2["issues"]:
+                                st.error(issue)
                 else:
-
                     for issue in q["issues"]:
                         st.error(issue)
 
@@ -3966,6 +4447,7 @@ elif page == "Data Quality":
                 st.error(
                     f"Unable to read dataset: {exc}"
                 )
+
 
     st.subheader(
         "Data Preview"
