@@ -885,6 +885,7 @@ def create_access_link(
             industry,
             token_hash,
             expires_at,
+            utc_iso(),
             created_by or st.session_state.get("username"),
         ),
     )
@@ -1548,16 +1549,18 @@ def quality_check(df, industry):
             "duplicates": 0,
         }
 
+    # Missing fields are onboarding warnings, not automatic rejection.
+    # Operational exports frequently contain only a subset of available KPIs.
     if "partner" not in df.columns:
-        issues.append(
-            "Required partner identifier column is missing."
+        warnings.append(
+            "Partner identifier was not detected. Rows will be retained, but a partner-level name should be mapped during onboarding."
         )
 
     primary = cfg["primary_kpi"]
 
     if primary not in df.columns:
-        issues.append(
-            f"Primary KPI '{primary}' is missing."
+        warnings.append(
+            f"Primary KPI '{primary}' is not present. PartnerOps will use available configured metrics and mark the primary KPI as unavailable."
         )
 
     duplicates = int(df.duplicated().sum())
@@ -1573,8 +1576,8 @@ def quality_check(df, industry):
         )
 
         if missing_partners:
-            issues.append(
-                f"{missing_partners} row(s) have no partner."
+            warnings.append(
+                f"{missing_partners} row(s) have no partner identifier."
             )
 
     if primary in df.columns:
@@ -3360,34 +3363,36 @@ def read_partnerops_upload(upload):
         )
 
     if ext in {"xlsx", "xls"}:
-        workbook = pd.ExcelFile(
-            io.BytesIO(raw)
-        )
-
-        frames = []
+        # Workbooks often contain README/metadata tabs before the real data.
+        # Score each sheet after normalization and select the strongest
+        # operational-data table instead of concatenating unrelated tabs.
+        workbook = pd.ExcelFile(io.BytesIO(raw))
+        best_df = None
+        best_score = None
 
         for sheet in workbook.sheet_names:
-            sheet_df = pd.read_excel(
-                workbook,
-                sheet_name=sheet,
+            sheet_df = pd.read_excel(workbook, sheet_name=sheet)
+            if sheet_df is None or sheet_df.dropna(how="all").empty:
+                continue
+
+            normalized_sheet = normalize_dataframe(sheet_df)
+            mapped = sum(
+                1 for col in COLUMN_ALIASES
+                if col in normalized_sheet.columns
             )
+            rows = len(normalized_sheet)
+            partner_bonus = 4 if "partner" in normalized_sheet.columns else 0
+            primary_bonus = 4 if "output" in normalized_sheet.columns else 0
+            score = mapped * 10 + partner_bonus + primary_bonus + min(rows, 100) / 100
 
-            if not sheet_df.dropna(
-                how="all"
-            ).empty:
-                sheet_df["__source_sheet"] = sheet
-                frames.append(sheet_df)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_df = sheet_df
 
-        if not frames:
-            raise ValueError(
-                "The Excel workbook contains no readable data."
-            )
+        if best_df is None:
+            raise ValueError("The Excel workbook contains no usable operational-data worksheet.")
 
-        return pd.concat(
-            frames,
-            ignore_index=True,
-            sort=False,
-        )
+        return best_df
 
     if ext == "json":
         return _json_to_dataframe(raw)
@@ -4329,7 +4334,7 @@ elif page == "Data Quality":
         )
     elif status["status"] == "REVIEW":
         st.warning(
-            "Dataset is usable but requires review."
+            "Dataset is usable. Review the warnings before relying on all intelligence outputs."
         )
     else:
         st.error(
@@ -4359,7 +4364,7 @@ elif page == "Data Quality":
     )
 
     if status["issues"]:
-        st.subheader("Blocking Issues")
+        st.subheader("Issues requiring attention")
 
         for issue in status["issues"]:
             st.error(issue)
