@@ -92,13 +92,37 @@ except Exception:
 PLATFORM_NAME = "PartnerOps"
 APP_VERSION = "5.1.1 Hardened Universal Ingestion"
 
-DB_FILE = os.getenv("PARTNEROPS_DB", "partnerops.db")
-BASE_URL = os.getenv(
-    "PARTNEROPS_BASE_URL",
-    "https://partnerops-rpeqjfrqr4cujvyazrvbvs.streamlit.app",
+
+def get_config_value(name, default=None):
+    """Read configuration from Streamlit Secrets first, then environment variables."""
+    try:
+        value = st.secrets.get(name)
+        if value is not None:
+            return str(value)
+    except Exception:
+        pass
+
+    value = os.getenv(name)
+    if value is not None:
+        return str(value)
+
+    return default
+
+
+DB_FILE = get_config_value("PARTNEROPS_DB", "partnerops.db")
+BASE_URL = str(
+    get_config_value(
+        "PARTNEROPS_BASE_URL",
+        "https://partnerops-rpeqjfrqr4cujvyazrvbvs.streamlit.app",
+    )
 ).rstrip("/")
 
-MAX_UPLOAD_MB = int(os.getenv("PARTNEROPS_MAX_UPLOAD_MB", "25"))
+try:
+    MAX_UPLOAD_MB = int(get_config_value("PARTNEROPS_MAX_UPLOAD_MB", "25"))
+except (TypeError, ValueError):
+    MAX_UPLOAD_MB = 25
+
+MAX_UPLOAD_MB = max(1, min(MAX_UPLOAD_MB, 200))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 SUPPORTED_UPLOAD_TYPES = [
@@ -106,17 +130,19 @@ SUPPORTED_UPLOAD_TYPES = [
     "pdf", "docx", "png", "jpg", "jpeg",
 ]
 
-ACCESS_SECRET = os.getenv(
+ACCESS_SECRET = get_config_value(
     "PARTNEROPS_ACCESS_SECRET",
-    "CHANGE_THIS_PARTNEROPS_SECRET_BEFORE_PRODUCTION"
+    "CHANGE_THIS_PARTNEROPS_SECRET_BEFORE_PRODUCTION",
 )
 
-INITIAL_ADMIN_PASSWORD = os.getenv(
+INITIAL_ADMIN_PASSWORD = get_config_value(
     "PARTNEROPS_INITIAL_ADMIN_PASSWORD",
-    "CHANGE_THIS_ADMIN_PASSWORD"
+    "CHANGE_THIS_ADMIN_PASSWORD",
 )
 
-PRODUCTION_MODE = os.getenv("PARTNEROPS_PRODUCTION", "false").lower() == "true"
+PRODUCTION_MODE = str(
+    get_config_value("PARTNEROPS_PRODUCTION", "false")
+).lower() == "true"
 
 PBKDF2_ITERATIONS = 210_000
 
@@ -1841,11 +1867,16 @@ def performance_engine(df, industry):
     result["target"] = cfg["target"]
 
     if primary in result.columns:
+        primary_values = pd.to_numeric(
+            result[primary],
+            errors="coerce",
+        )
+
         result["target_gap"] = (
-            cfg["target"] - result[primary]
+            cfg["target"] - primary_values
         ).round(2)
     else:
-        result["target_gap"] = pd.NA
+        result["target_gap"] = float("nan")
 
     result["band"] = result["performance_score"].apply(
         score_band
@@ -3563,12 +3594,11 @@ if page == "Command Center":
         performance_df
     )
 
-    avg_health = round(
-        performance_df[
-            "performance_score"
-        ].mean(),
-        1,
-    )
+    avg_health = pd.to_numeric(
+        performance_df["performance_score"],
+        errors="coerce",
+    ).mean()
+    avg_health = 0.0 if pd.isna(avg_health) else round(float(avg_health), 1)
 
     target = INDUSTRIES[
         industry
@@ -3590,12 +3620,11 @@ if page == "Command Center":
         ).sum()
     )
 
-    recovery = round(
-        performance_df[
-            "recovery_opportunity"
-        ].sum(),
-        2,
-    )
+    recovery = pd.to_numeric(
+        performance_df["recovery_opportunity"],
+        errors="coerce",
+    ).fillna(0).sum()
+    recovery = round(float(recovery), 2)
 
     c1, c2, c3, c4, c5 = st.columns(5)
 
@@ -3808,9 +3837,11 @@ elif page == "Partner Detail":
         row["risk"],
     )
 
+    target_gap = row["target_gap"]
+
     c4.metric(
         "Target Gap",
-        f"{row['target_gap']:.1f}",
+        "N/A" if pd.isna(target_gap) else f"{float(target_gap):.1f}",
     )
 
     st.subheader("Diagnosis")
