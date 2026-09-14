@@ -1900,14 +1900,27 @@ def performance_engine(df, industry):
         axis=1,
     )
 
+    # Recovery opportunity must always be calculated from numeric series.
+    # Uploaded workbooks can contain blanks, text, commas, or mixed types even
+    # after normalization, so coerce again at the final calculation boundary.
+    target_gap_numeric = pd.to_numeric(
+        result["target_gap"],
+        errors="coerce",
+    )
+
     if "output" in result.columns:
+        output_numeric = pd.to_numeric(
+            result["output"],
+            errors="coerce",
+        )
+
         result["recovery_opportunity"] = (
-            result["target_gap"].clip(lower=0)
-            * result["output"]
+            target_gap_numeric.clip(lower=0).fillna(0)
+            * output_numeric.fillna(0)
             / 100
         ).round(2)
     else:
-        result["recovery_opportunity"] = 0
+        result["recovery_opportunity"] = 0.0
 
     def priority(score):
         if score < 50:
