@@ -1776,6 +1776,28 @@ def performance_engine(df, industry):
     cfg = INDUSTRIES[industry]
     result = df.copy()
 
+    # Guarantee a partner identifier for every downstream view. If the source
+    # file has no recognizable partner column, preserve the rows and assign
+    # neutral labels instead of allowing a KeyError in the Command Center.
+    if "partner" not in result.columns:
+        result["partner"] = [
+            f"Unidentified Partner {i + 1}"
+            for i in range(len(result))
+        ]
+    else:
+        result["partner"] = (
+            result["partner"]
+            .astype("string")
+            .fillna("Unidentified Partner")
+            .replace(
+                {
+                    "": "Unidentified Partner",
+                    "<NA>": "Unidentified Partner",
+                    "nan": "Unidentified Partner",
+                }
+            )
+        )
+
     for metric in cfg["weights"]:
         if metric not in result.columns:
             result[metric] = pd.NA
@@ -3672,19 +3694,46 @@ if page == "Command Center":
         "Priority Recovery Queue"
     )
 
-    queue = performance_df[
-        performance_df["attention_required"]
-    ][
-        [
-            "partner",
-            "performance_score",
-            "band",
-            "risk",
-            "priority",
-            "target_gap",
-            "recovery_opportunity",
-            "recommended_action",
-        ]
+    queue_columns = [
+        "partner",
+        "performance_score",
+        "band",
+        "risk",
+        "priority",
+        "target_gap",
+        "recovery_opportunity",
+        "recommended_action",
+    ]
+
+    # Defensive presentation layer: never allow an incomplete source dataset
+    # to crash the Command Center because a display column is absent.
+    for col in queue_columns:
+        if col not in performance_df.columns:
+            if col == "partner":
+                performance_df[col] = [
+                    f"Unidentified Partner {i + 1}"
+                    for i in range(len(performance_df))
+                ]
+            elif col == "recommended_action":
+                performance_df[col] = "Continue monitoring."
+            elif col == "band":
+                performance_df[col] = "Unknown"
+            elif col == "risk":
+                performance_df[col] = "Unknown"
+            elif col == "priority":
+                performance_df[col] = "P4"
+            else:
+                performance_df[col] = 0.0
+
+    attention_mask = performance_df.get(
+        "attention_required",
+        pd.Series(False, index=performance_df.index),
+    )
+    attention_mask = attention_mask.fillna(False).astype(bool)
+
+    queue = performance_df.loc[
+        attention_mask,
+        queue_columns,
     ].copy()
 
     st.dataframe(
@@ -3742,8 +3791,11 @@ elif page == "Executive Intelligence":
         hide_index=True,
     )
 
-    strongest = performance_df.iloc[0]
+    if performance_df.empty:
+        st.info("No partner records are available for executive intelligence.")
+        st.stop()
 
+    strongest = performance_df.iloc[0]
     weakest = performance_df.iloc[-1]
 
     st.success(
@@ -3823,6 +3875,10 @@ elif page == "Partner Detail":
         .astype(str)
         .tolist()
     )
+
+    if not partners:
+        st.info("No partner records are available.")
+        st.stop()
 
     selected = st.selectbox(
         "Select partner",
