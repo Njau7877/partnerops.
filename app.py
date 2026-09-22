@@ -56,6 +56,7 @@ import hashlib
 import secrets
 import sqlite3
 import logging
+import zipfile
 from difflib import SequenceMatcher
 from datetime import datetime, date, timedelta, timezone
 from abc import ABC, abstractmethod
@@ -90,7 +91,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.1.1 Hardened Universal Ingestion"
+APP_VERSION = "5.2.0 Security & Production Hardened"
 
 
 def get_config_value(name, default=None):
@@ -124,6 +125,28 @@ except (TypeError, ValueError):
 
 MAX_UPLOAD_MB = max(1, min(MAX_UPLOAD_MB, 200))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Defensive processing limits. These protect the Streamlit process from
+# unexpectedly expensive uploads even when the raw file is below the byte limit.
+try:
+    MAX_UPLOAD_ROWS = int(get_config_value("PARTNEROPS_MAX_UPLOAD_ROWS", "250000"))
+except (TypeError, ValueError):
+    MAX_UPLOAD_ROWS = 250000
+MAX_UPLOAD_ROWS = max(1000, min(MAX_UPLOAD_ROWS, 1000000))
+
+try:
+    MAX_UPLOAD_COLUMNS = int(get_config_value("PARTNEROPS_MAX_UPLOAD_COLUMNS", "250"))
+except (TypeError, ValueError):
+    MAX_UPLOAD_COLUMNS = 250
+MAX_UPLOAD_COLUMNS = max(20, min(MAX_UPLOAD_COLUMNS, 1000))
+
+MAX_UPLOAD_CELLS = MAX_UPLOAD_ROWS * MAX_UPLOAD_COLUMNS
+MAX_ZIP_MEMBERS = 5000
+MAX_ZIP_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
+MAX_IMAGE_PIXELS = 50_000_000
+MAX_PDF_PAGES = 250
+SESSION_IDLE_MINUTES = 60
+SESSION_MAX_MINUTES = 12 * 60
 
 SUPPORTED_UPLOAD_TYPES = [
     "csv", "xlsx", "xls", "json", "txt",
@@ -496,6 +519,8 @@ def get_db():
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -562,7 +587,10 @@ def init_db():
             expires_at TEXT NOT NULL,
             active INTEGER DEFAULT 1,
             created_at TEXT NOT NULL,
-            created_by TEXT
+            created_by TEXT,
+            revoked_at TEXT,
+            last_seen_at TEXT,
+            use_count INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS datasets (
@@ -630,6 +658,22 @@ def init_db():
         );
         """
     )
+
+    # Backward-compatible migrations for databases created by 5.1.x.
+    existing = {row[1] for row in cur.execute("PRAGMA table_info(access_links)").fetchall()}
+    migrations = {
+        "revoked_at": "ALTER TABLE access_links ADD COLUMN revoked_at TEXT",
+        "last_seen_at": "ALTER TABLE access_links ADD COLUMN last_seen_at TEXT",
+        "use_count": "ALTER TABLE access_links ADD COLUMN use_count INTEGER DEFAULT 0",
+    }
+    for column, statement in migrations.items():
+        if column not in existing:
+            cur.execute(statement)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_access_links_token_hash ON access_links(token_hash)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_datasets_tenant_industry ON datasets(tenant_id, industry, dataset_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_dataset_rows_tenant_industry ON dataset_rows(tenant_id, industry, dataset_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_tenant_time ON audit_log(tenant_id, timestamp)")
 
     conn.commit()
     conn.close()
@@ -886,6 +930,10 @@ def create_access_link(
     created_by=None,
 ):
     """Create an opaque, server-resolved customer access credential."""
+    tenant = get_tenant(tenant_id)
+    if not tenant or tenant["status"] != "active":
+        raise ValueError("Customer tenant is not active.")
+
     if not tenant_industry_enabled(tenant_id, industry):
         raise ValueError("Industry is not entitled for this customer.")
 
@@ -895,35 +943,36 @@ def create_access_link(
 
     token = secrets.token_urlsafe(48)
     token_hash = hash_access_token(token)
+    expires_at = (utc_now() + timedelta(days=days)).isoformat()
+    created_at = utc_iso()
 
-    expires_at = (
-        utc_now() + timedelta(days=days)
-    ).isoformat()
-
-    db_execute(
-        """
-        INSERT INTO access_links
-        (tenant_id, industry, token_hash, expires_at, active, created_at, created_by)
-        VALUES (?, ?, ?, ?, 1, ?, ?)
-        """,
-        (
-            tenant_id,
-            industry,
-            token_hash,
-            expires_at,
-            utc_iso(),
-            created_by or st.session_state.get("username"),
-        ),
-    )
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO access_links
+            (tenant_id, industry, token_hash, expires_at, active, created_at, created_by)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                tenant_id,
+                industry,
+                token_hash,
+                expires_at,
+                created_at,
+                created_by or st.session_state.get("username"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
     audit(
         "ACCESS_LINK_CREATED",
         "access_link",
         token_hash[:12],
-        {
-            "industry": industry,
-            "expires_at": expires_at,
-        },
+        {"industry": industry, "expires_at": expires_at},
         tenant_id=tenant_id,
     )
 
@@ -933,18 +982,16 @@ def create_access_link(
 
 
 def validate_access_token(token):
-    """Resolve an opaque token to its server-side customer scope."""
-    if not token or not isinstance(token, str) or len(token) < 32:
+    """Resolve an opaque token and re-check authorization on every app rerun."""
+    if not token or not isinstance(token, str) or len(token) < 32 or len(token) > 256:
         return None
 
     token_hash = hash_access_token(token)
-
     rows = db_execute(
         """
-        SELECT tenant_id, industry, expires_at
+        SELECT link_id, tenant_id, industry, expires_at, active, revoked_at
         FROM access_links
         WHERE token_hash = ?
-          AND active = 1
         ORDER BY link_id DESC
         LIMIT 1
         """,
@@ -956,28 +1003,42 @@ def validate_access_token(token):
         return None
 
     row = rows[0]
+    if not row["active"] or row["revoked_at"]:
+        return None
 
     try:
         expires = datetime.fromisoformat(row["expires_at"])
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=timezone.utc)
-        if expires < utc_now():
+        if expires <= utc_now():
+            db_execute(
+                "UPDATE access_links SET active = 0 WHERE link_id = ?",
+                (row["link_id"],),
+            )
             return None
     except Exception:
         return None
 
-    tenant_id = row["tenant_id"]
-    industry = row["industry"]
-
-    if not tenant_exists(tenant_id):
+    tenant = get_tenant(row["tenant_id"])
+    if not tenant or tenant["status"] != "active":
         return None
 
-    if not tenant_industry_enabled(tenant_id, industry):
+    if not tenant_industry_enabled(row["tenant_id"], row["industry"]):
         return None
+
+    db_execute(
+        """
+        UPDATE access_links
+        SET last_seen_at = ?, use_count = COALESCE(use_count, 0) + 1
+        WHERE link_id = ? AND active = 1
+        """,
+        (utc_iso(), row["link_id"]),
+    )
 
     return {
-        "tenant_id": tenant_id,
-        "industry": industry,
+        "link_id": row["link_id"],
+        "tenant_id": row["tenant_id"],
+        "industry": row["industry"],
         "expires_at": row["expires_at"],
     }
 
@@ -998,10 +1059,10 @@ def rotate_customer_links(tenant_id, industry):
     db_execute(
         """
         UPDATE access_links
-        SET active = 0
+        SET active = 0, revoked_at = ?
         WHERE tenant_id = ? AND industry = ?
         """,
-        (tenant_id, industry),
+        (utc_iso(), tenant_id, industry),
     )
 
     audit(
@@ -1036,6 +1097,15 @@ def process_customer_access():
         scope = validate_access_token(token)
 
         if scope:
+            same_session = (
+                st.session_state.get("access_mode") == "customer"
+                and st.session_state.get("authenticated") is True
+                and hmac.compare_digest(
+                    str(st.session_state.get("access_token") or ""),
+                    str(token),
+                )
+            )
+
             st.session_state.authenticated = True
             st.session_state.access_mode = "customer"
             st.session_state.tenant_id = scope["tenant_id"]
@@ -1043,6 +1113,26 @@ def process_customer_access():
             st.session_state.current_industry = scope["industry"]
             st.session_state.role = "Viewer"
             st.session_state.username = "customer_link"
+            st.session_state.access_token = token
+
+            if not same_session:
+                now = utc_iso()
+                st.session_state.session_started_at = now
+                st.session_state.last_activity_at = now
+                audit(
+                    "CUSTOMER_ACCESS_GRANTED",
+                    "access_link",
+                    scope["link_id"],
+                    {"industry": scope["industry"]},
+                    tenant_id=scope["tenant_id"],
+                    username="customer_link",
+                )
+
+            # Keep the credential out of the visible browser URL after bootstrap.
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
             return True
 
         audit(
@@ -1078,6 +1168,9 @@ DEFAULT_STATE = {
     "current_df": None,
     "generated_link": None,
     "selected_partner": None,
+    "access_token": None,
+    "session_started_at": None,
+    "last_activity_at": None,
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -1086,6 +1179,66 @@ for key, value in DEFAULT_STATE.items():
 
 
 customer_access = process_customer_access()
+
+
+def revalidate_customer_session():
+    """Re-check customer authorization on every Streamlit rerun."""
+    if st.session_state.get("access_mode") != "customer":
+        return
+
+    token = st.session_state.get("access_token")
+    if not token:
+        st.session_state.authenticated = False
+        st.error("Customer session is no longer valid. Please use a current access link.")
+        st.stop()
+
+    scope = validate_access_token(token)
+    if not scope:
+        audit(
+            "CUSTOMER_SESSION_REVOKED",
+            "access_link",
+            "session",
+            {"reason": "link_disabled_expired_or_tenant_disabled"},
+            tenant_id=st.session_state.get("tenant_id"),
+            username="customer_link",
+        )
+        for key in DEFAULT_STATE:
+            st.session_state[key] = DEFAULT_STATE[key]
+        st.error("Access revoked or expired. This customer workspace is no longer available.")
+        st.stop()
+
+    now = utc_now()
+    try:
+        started = datetime.fromisoformat(st.session_state.get("session_started_at"))
+        last = datetime.fromisoformat(st.session_state.get("last_activity_at"))
+        if started.tzinfo is None: started = started.replace(tzinfo=timezone.utc)
+        if last.tzinfo is None: last = last.replace(tzinfo=timezone.utc)
+    except Exception:
+        started = now
+        last = now
+        st.session_state.session_started_at = now.isoformat()
+
+    if now - last > timedelta(minutes=SESSION_IDLE_MINUTES) or now - started > timedelta(minutes=SESSION_MAX_MINUTES):
+        audit(
+            "CUSTOMER_SESSION_EXPIRED",
+            "access_link",
+            scope["link_id"],
+            {"reason": "session_timeout"},
+            tenant_id=scope["tenant_id"],
+            username="customer_link",
+        )
+        for key in DEFAULT_STATE:
+            st.session_state[key] = DEFAULT_STATE[key]
+        st.error("Your customer session expired. Please open a fresh access link.")
+        st.stop()
+
+    st.session_state.tenant_id = scope["tenant_id"]
+    st.session_state.locked_industry = scope["industry"]
+    st.session_state.current_industry = scope["industry"]
+    st.session_state.last_activity_at = now.isoformat()
+
+
+revalidate_customer_session()
 
 
 # ============================================================
@@ -1776,28 +1929,6 @@ def performance_engine(df, industry):
     cfg = INDUSTRIES[industry]
     result = df.copy()
 
-    # Guarantee a partner identifier for every downstream view. If the source
-    # file has no recognizable partner column, preserve the rows and assign
-    # neutral labels instead of allowing a KeyError in the Command Center.
-    if "partner" not in result.columns:
-        result["partner"] = [
-            f"Unidentified Partner {i + 1}"
-            for i in range(len(result))
-        ]
-    else:
-        result["partner"] = (
-            result["partner"]
-            .astype("string")
-            .fillna("Unidentified Partner")
-            .replace(
-                {
-                    "": "Unidentified Partner",
-                    "<NA>": "Unidentified Partner",
-                    "nan": "Unidentified Partner",
-                }
-            )
-        )
-
     for metric in cfg["weights"]:
         if metric not in result.columns:
             result[metric] = pd.NA
@@ -1922,27 +2053,14 @@ def performance_engine(df, industry):
         axis=1,
     )
 
-    # Recovery opportunity must always be calculated from numeric series.
-    # Uploaded workbooks can contain blanks, text, commas, or mixed types even
-    # after normalization, so coerce again at the final calculation boundary.
-    target_gap_numeric = pd.to_numeric(
-        result["target_gap"],
-        errors="coerce",
-    )
-
     if "output" in result.columns:
-        output_numeric = pd.to_numeric(
-            result["output"],
-            errors="coerce",
-        )
-
         result["recovery_opportunity"] = (
-            target_gap_numeric.clip(lower=0).fillna(0)
-            * output_numeric.fillna(0)
+            result["target_gap"].clip(lower=0)
+            * result["output"]
             / 100
         ).round(2)
     else:
-        result["recovery_opportunity"] = 0.0
+        result["recovery_opportunity"] = 0
 
     def priority(score):
         if score < 50:
@@ -2262,77 +2380,53 @@ def save_dataset(
     quality_status,
     industry,
 ):
+    """Persist a tenant-scoped dataset atomically and return its id."""
     tenant_id = st.session_state.tenant_id
+    if not tenant_id or not tenant_industry_enabled(tenant_id, industry):
+        raise PermissionError("Dataset cannot be saved outside the authorized tenant scope.")
 
-    cursor_rows = db_execute(
-        """
-        INSERT INTO datasets
-        (tenant_id, industry, filename, row_count,
-         quality_status, uploaded_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            tenant_id,
-            industry,
-            filename,
-            len(df),
-            quality_status,
-            st.session_state.username,
-            utc_iso(),
-        ),
-    )
+    if len(df) > MAX_UPLOAD_ROWS or len(df.columns) > MAX_UPLOAD_COLUMNS:
+        raise ValueError("Dataset exceeds the configured processing limits.")
 
-    # Retrieve latest ID.
-    rows = db_execute(
-        """
-        SELECT dataset_id
-        FROM datasets
-        WHERE tenant_id = ?
-        ORDER BY dataset_id DESC
-        LIMIT 1
-        """,
-        (tenant_id,),
-        fetch=True,
-    )
-
-    dataset_id = rows[0]["dataset_id"]
-
-    payloads = []
-
-    for _, row in df.iterrows():
-        payloads.append(
-            (
-                dataset_id,
-                tenant_id,
-                industry,
-                json.dumps(
-                    row.to_dict(),
-                    default=str,
-                ),
-            )
-        )
-
-    if payloads:
-        db_execute(
+    conn = get_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
             """
-            INSERT INTO dataset_rows
-            (dataset_id, tenant_id, industry, row_json)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO datasets
+            (tenant_id, industry, filename, row_count, quality_status, uploaded_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            payloads,
-            many=True,
+            (tenant_id, industry, filename, len(df), quality_status, st.session_state.username, utc_iso()),
         )
+        dataset_id = cur.lastrowid
+
+        payloads = [
+            (dataset_id, tenant_id, industry, json.dumps(row.to_dict(), default=str))
+            for _, row in df.iterrows()
+        ]
+        if payloads:
+            cur.executemany(
+                """
+                INSERT INTO dataset_rows (dataset_id, tenant_id, industry, row_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                payloads,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     audit(
         "DATASET_UPLOADED",
         "dataset",
         dataset_id,
-        {
-            "filename": filename,
-            "rows": len(df),
-            "quality": quality_status,
-        },
+        {"filename": filename, "rows": len(df), "quality": quality_status},
     )
+    return dataset_id
 
 
 def load_latest_saved_dataset(tenant_id, industry):
@@ -2548,9 +2642,11 @@ def get_current_data(industry):
     if saved is not None:
         return normalize_dataframe(saved)
 
-    return normalize_dataframe(
-        get_demo_data(industry)
-    )
+    # Customer links never fall back to global/demo operational data.
+    if st.session_state.get("access_mode") == "customer":
+        return pd.DataFrame()
+
+    return normalize_dataframe(get_demo_data(industry))
 
 
 def set_current_data(df, industry, filename="current_dataset"):
@@ -3190,6 +3286,10 @@ if st.sidebar.button(
 
     for key in DEFAULT_STATE:
         st.session_state[key] = DEFAULT_STATE[key]
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
 
     st.rerun()
 
@@ -3271,6 +3371,8 @@ def _pdf_to_dataframe(raw_bytes):
     text_chunks = []
 
     with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+        if len(pdf.pages) > MAX_PDF_PAGES:
+            raise ValueError(f"PDF contains {len(pdf.pages)} pages; maximum supported is {MAX_PDF_PAGES}.")
         for page in pdf.pages:
             page_tables = page.extract_tables() or []
 
@@ -3387,97 +3489,120 @@ def _image_to_dataframe(raw_bytes):
     )
 
 
+def _validate_upload_dataframe(df):
+    if df is None or not isinstance(df, pd.DataFrame):
+        raise ValueError("The uploaded content did not produce a valid dataset.")
+    if df.empty:
+        raise ValueError("The uploaded dataset contains no rows.")
+    if len(df) > MAX_UPLOAD_ROWS:
+        raise ValueError(f"Dataset has {len(df):,} rows; maximum is {MAX_UPLOAD_ROWS:,}.")
+    if len(df.columns) > MAX_UPLOAD_COLUMNS:
+        raise ValueError(f"Dataset has {len(df.columns):,} columns; maximum is {MAX_UPLOAD_COLUMNS:,}.")
+    if len(df) * max(1, len(df.columns)) > MAX_UPLOAD_CELLS:
+        raise ValueError("Dataset exceeds the configured cell-processing limit.")
+    return df
+
+
+def _validate_archive(raw_bytes, label):
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_ZIP_MEMBERS:
+                raise ValueError(f"{label} contains too many archive members.")
+            total = sum(max(0, int(i.file_size)) for i in infos)
+            if total > MAX_ZIP_UNCOMPRESSED_BYTES:
+                raise ValueError(f"{label} expands beyond the safe processing limit.")
+            for info in infos:
+                if info.file_size > MAX_ZIP_UNCOMPRESSED_BYTES:
+                    raise ValueError(f"{label} contains an oversized archive member.")
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Invalid {label} archive.") from exc
+
+
+def _validate_file_signature(ext, raw):
+    signatures = {
+        "pdf": raw.startswith(b"%PDF"),
+        "png": raw.startswith(b"\x89PNG\r\n\x1a\n"),
+        "jpg": raw.startswith(b"\xff\xd8\xff"),
+        "jpeg": raw.startswith(b"\xff\xd8\xff"),
+        "xlsx": raw.startswith(b"PK"),
+        "docx": raw.startswith(b"PK"),
+        "xls": raw.startswith(b"\xd0\xcf\x11\xe0"),
+    }
+    if ext in signatures and not signatures[ext]:
+        raise ValueError("The file content does not match its extension.")
+
+
 def read_partnerops_upload(upload):
-    """Convert a supported upload into a DataFrame without accepting it."""
+    """Safely convert a supported upload into a bounded DataFrame."""
     if upload is None:
         raise ValueError("No file was supplied.")
 
     size = getattr(upload, "size", None)
-
     if size is not None and size > MAX_UPLOAD_BYTES:
-        raise ValueError(
-            f"File is too large. Maximum supported upload "
-            f"is {MAX_UPLOAD_MB} MB."
-        )
+        raise ValueError(f"File is too large. Maximum supported upload is {MAX_UPLOAD_MB} MB.")
 
-    name = str(
-        getattr(upload, "name", "upload")
-    ).strip()
-
-    ext = (
-        name.lower().rsplit(".", 1)[-1]
-        if "." in name
-        else ""
-    )
-
+    name = str(getattr(upload, "name", "upload")).strip()
+    ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
     if ext not in SUPPORTED_UPLOAD_TYPES:
-        raise ValueError(
-            "Unsupported file type. Supported formats: "
-            + ", ".join(SUPPORTED_UPLOAD_TYPES)
-        )
+        raise ValueError("Unsupported file type. Supported formats: " + ", ".join(SUPPORTED_UPLOAD_TYPES))
 
     raw = upload.getvalue()
-
     if not raw:
-        raise ValueError(
-            "The uploaded file is empty."
-        )
+        raise ValueError("The uploaded file is empty.")
+
+    _validate_file_signature(ext, raw)
+    if ext in {"xlsx", "docx"}:
+        _validate_archive(raw, ext.upper())
 
     if ext == "csv":
-        return pd.read_csv(
-            io.BytesIO(raw)
-        )
+        result = pd.read_csv(io.BytesIO(raw), low_memory=False)
+    elif ext in {"xlsx", "xls"}:
+        if ext == "xlsx":
+            workbook = pd.ExcelFile(io.BytesIO(raw))
+            if len(workbook.sheet_names) > 100:
+                raise ValueError("Workbook contains too many worksheets.")
+            best_df = None
+            best_score = None
+            for sheet in workbook.sheet_names:
+                sheet_df = pd.read_excel(workbook, sheet_name=sheet)
+                if sheet_df is None or sheet_df.dropna(how="all").empty:
+                    continue
+                if len(sheet_df) > MAX_UPLOAD_ROWS or len(sheet_df.columns) > MAX_UPLOAD_COLUMNS:
+                    continue
+                normalized_sheet = normalize_dataframe(sheet_df)
+                mapped = sum(1 for col in COLUMN_ALIASES if col in normalized_sheet.columns)
+                rows = len(normalized_sheet)
+                partner_bonus = 4 if "partner" in normalized_sheet.columns else 0
+                primary_bonus = 4 if "output" in normalized_sheet.columns else 0
+                score = mapped * 10 + partner_bonus + primary_bonus + min(rows, 100) / 100
+                if best_score is None or score > best_score:
+                    best_score, best_df = score, sheet_df
+            if best_df is None:
+                raise ValueError("The Excel workbook contains no usable operational-data worksheet within safety limits.")
+            result = best_df
+        else:
+            result = pd.read_excel(io.BytesIO(raw))
+    elif ext == "json":
+        result = _json_to_dataframe(raw)
+    elif ext == "txt":
+        result = _read_text_as_table(raw)
+    elif ext == "pdf":
+        result = _pdf_to_dataframe(raw)
+    elif ext == "docx":
+        result = _docx_to_dataframe(raw)
+    elif ext in {"png", "jpg", "jpeg"}:
+        if Image is None:
+            raise RuntimeError("Image support is not installed.")
+        with Image.open(io.BytesIO(raw)) as image:
+            width, height = image.size
+            if width * height > MAX_IMAGE_PIXELS:
+                raise ValueError("Image dimensions exceed the safe OCR limit.")
+        result = _image_to_dataframe(raw)
+    else:
+        raise ValueError("Unable to process the uploaded file.")
 
-    if ext in {"xlsx", "xls"}:
-        # Workbooks often contain README/metadata tabs before the real data.
-        # Score each sheet after normalization and select the strongest
-        # operational-data table instead of concatenating unrelated tabs.
-        workbook = pd.ExcelFile(io.BytesIO(raw))
-        best_df = None
-        best_score = None
-
-        for sheet in workbook.sheet_names:
-            sheet_df = pd.read_excel(workbook, sheet_name=sheet)
-            if sheet_df is None or sheet_df.dropna(how="all").empty:
-                continue
-
-            normalized_sheet = normalize_dataframe(sheet_df)
-            mapped = sum(
-                1 for col in COLUMN_ALIASES
-                if col in normalized_sheet.columns
-            )
-            rows = len(normalized_sheet)
-            partner_bonus = 4 if "partner" in normalized_sheet.columns else 0
-            primary_bonus = 4 if "output" in normalized_sheet.columns else 0
-            score = mapped * 10 + partner_bonus + primary_bonus + min(rows, 100) / 100
-
-            if best_score is None or score > best_score:
-                best_score = score
-                best_df = sheet_df
-
-        if best_df is None:
-            raise ValueError("The Excel workbook contains no usable operational-data worksheet.")
-
-        return best_df
-
-    if ext == "json":
-        return _json_to_dataframe(raw)
-
-    if ext == "txt":
-        return _read_text_as_table(raw)
-
-    if ext == "pdf":
-        return _pdf_to_dataframe(raw)
-
-    if ext == "docx":
-        return _docx_to_dataframe(raw)
-
-    if ext in {"png", "jpg", "jpeg"}:
-        return _image_to_dataframe(raw)
-
-    raise ValueError(
-        "Unable to process the uploaded file."
-    )
+    return _validate_upload_dataframe(result)
 
 
 def ingestion_summary(
@@ -3694,46 +3819,19 @@ if page == "Command Center":
         "Priority Recovery Queue"
     )
 
-    queue_columns = [
-        "partner",
-        "performance_score",
-        "band",
-        "risk",
-        "priority",
-        "target_gap",
-        "recovery_opportunity",
-        "recommended_action",
-    ]
-
-    # Defensive presentation layer: never allow an incomplete source dataset
-    # to crash the Command Center because a display column is absent.
-    for col in queue_columns:
-        if col not in performance_df.columns:
-            if col == "partner":
-                performance_df[col] = [
-                    f"Unidentified Partner {i + 1}"
-                    for i in range(len(performance_df))
-                ]
-            elif col == "recommended_action":
-                performance_df[col] = "Continue monitoring."
-            elif col == "band":
-                performance_df[col] = "Unknown"
-            elif col == "risk":
-                performance_df[col] = "Unknown"
-            elif col == "priority":
-                performance_df[col] = "P4"
-            else:
-                performance_df[col] = 0.0
-
-    attention_mask = performance_df.get(
-        "attention_required",
-        pd.Series(False, index=performance_df.index),
-    )
-    attention_mask = attention_mask.fillna(False).astype(bool)
-
-    queue = performance_df.loc[
-        attention_mask,
-        queue_columns,
+    queue = performance_df[
+        performance_df["attention_required"]
+    ][
+        [
+            "partner",
+            "performance_score",
+            "band",
+            "risk",
+            "priority",
+            "target_gap",
+            "recovery_opportunity",
+            "recommended_action",
+        ]
     ].copy()
 
     st.dataframe(
@@ -3791,11 +3889,8 @@ elif page == "Executive Intelligence":
         hide_index=True,
     )
 
-    if performance_df.empty:
-        st.info("No partner records are available for executive intelligence.")
-        st.stop()
-
     strongest = performance_df.iloc[0]
+
     weakest = performance_df.iloc[-1]
 
     st.success(
@@ -3875,10 +3970,6 @@ elif page == "Partner Detail":
         .astype(str)
         .tolist()
     )
-
-    if not partners:
-        st.info("No partner records are available.")
-        st.stop()
 
     selected = st.selectbox(
         "Select partner",
@@ -5134,7 +5225,10 @@ elif page == "Administration":
                 expires_at,
                 active,
                 created_at,
-                created_by
+                created_by,
+                revoked_at,
+                last_seen_at,
+                use_count
             FROM access_links
             ORDER BY link_id DESC
             """,
@@ -5551,9 +5645,9 @@ elif page == "Administration":
                 )
 
         st.warning(
-            "For production enterprise deployment, move from local SQLite "
-            "to managed PostgreSQL or equivalent, use a proper secrets "
-            "manager, HTTPS, backups, monitoring and independent security testing."
+            "Application security is hardened, but Streamlit Community Cloud + local SQLite "
+            "is still pilot infrastructure. For production customer data, use managed PostgreSQL "
+            "or equivalent, durable backups, monitoring, a secrets manager, HTTPS and independent security testing."
         )
 
 
