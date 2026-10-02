@@ -91,7 +91,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.2.0 Security & Production Hardened"
+APP_VERSION = "5.2.0 Security & Production Hardened + Sufficiency Gate"
 
 
 def get_config_value(name, default=None):
@@ -1514,6 +1514,55 @@ COLUMN_ALIASES = {
         "timestamp",
         "created_at",
     ],
+    # Evidence fields used by the Data Sufficiency Gate. These are additive
+    # aliases; existing performance-engine fields remain unchanged.
+    "target": [
+        "target",
+        "benchmark",
+        "target_rate",
+        "target_pct",
+        "sla_target",
+        "service_target",
+    ],
+    "workload": [
+        "workload",
+        "volume",
+        "jobs",
+        "orders",
+        "cases",
+        "cases_received",
+        "requests",
+        "tickets",
+        "visits",
+        "transactions",
+        "units",
+        "total_jobs",
+        "total_orders",
+        "received",
+    ],
+    "status": [
+        "status",
+        "result",
+        "outcome",
+        "state",
+        "disposition",
+    ],
+    "sla": [
+        "sla",
+        "sla_status",
+        "service_level",
+        "service_level_status",
+        "on_time",
+        "on_time_rate",
+    ],
+    "turnaround": [
+        "turnaround",
+        "turnaround_time",
+        "turnaround_days",
+        "tat",
+        "processing_time",
+        "resolution_time",
+    ],
 }
 
 
@@ -1802,6 +1851,309 @@ def quality_check(df, industry):
         "columns": len(df.columns),
         "duplicates": duplicates,
     }
+
+
+# ============================================================
+# 15. DATA SUFFICIENCY GATE
+# ============================================================
+#
+# This is intentionally separate from quality_check(). Data quality answers
+# "Can we safely read/use this dataset?" Data sufficiency answers
+# "Does this dataset contain enough operational evidence to support the
+# diagnostic claims PartnerOps is about to make?"
+#
+# The gate is conservative: it never invents evidence, targets, history or
+# root causes. It sits in front of the existing intelligence engine and is
+# additive to the 5.2.0 workflow.
+
+SUFFICIENCY_EVIDENCE = {
+    "Telecom / ISP / OSP": {
+        "entity": "partner",
+        "workload": ["workload", "output", "completed"],
+        "status": ["status", "completed", "pending", "failure_rate", "completion_rate"],
+        "context": ["quality", "productivity", "sla", "turnaround", "pending", "aging"],
+    },
+    "Logistics / Delivery": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "delivery_rate", "failure_rate"],
+        "context": ["sla", "turnaround", "aging", "quality"],
+    },
+    "Field Service / Contractors": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "completion_rate"],
+        "context": ["sla", "turnaround", "quality", "aging", "productivity"],
+    },
+    "Distribution / FMCG": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "fulfillment_rate", "failure_rate"],
+        "context": ["sla", "turnaround", "quality", "aging"],
+    },
+    "Banking / Fintech / Agents": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "success_rate", "failure_rate"],
+        "context": ["sla", "turnaround", "quality", "aging"],
+    },
+    "Energy / Utilities": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
+        "context": ["sla", "turnaround", "quality", "aging", "productivity"],
+    },
+    "Insurance": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
+        "context": ["sla", "turnaround", "quality", "aging"],
+    },
+    "Construction": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
+        "context": ["sla", "turnaround", "quality", "aging", "productivity"],
+    },
+    "Healthcare": {
+        "entity": "partner",
+        "workload": ["workload", "output"],
+        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
+        "context": ["sla", "turnaround", "quality", "aging"],
+    },
+}
+
+SUFFICIENCY_WEIGHTS = {
+    "entity": 15,
+    "date": 15,
+    "outcome": 20,
+    "benchmark": 15,
+    "workload": 15,
+    "status": 10,
+    "history": 10,
+}
+
+
+def _coverage(df, column, numeric=False):
+    if df is None or df.empty or column not in df.columns:
+        return 0.0
+    series = df[column]
+    if numeric:
+        series = pd.to_numeric(series, errors="coerce")
+    else:
+        series = series.astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return float(series.notna().mean())
+
+
+def _first_available_column(df, candidates):
+    if df is None:
+        return None
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
+
+
+def _evidence_item(label, points, available, detail):
+    return {
+        "evidence": label,
+        "points": points if available else 0,
+        "max_points": points,
+        "available": bool(available),
+        "detail": detail,
+    }
+
+
+def data_sufficiency_check(df, industry):
+    """Assess whether the selected operational model has enough evidence for diagnosis."""
+    cfg = INDUSTRIES[industry]
+    rules = SUFFICIENCY_EVIDENCE.get(industry, SUFFICIENCY_EVIDENCE["Telecom / ISP / OSP"])
+    items = []
+    missing = []
+    limitations = []
+
+    if df is None or df.empty:
+        return {
+            "status": "RED",
+            "readiness": 0,
+            "score": 0,
+            "items": [],
+            "missing": ["Operational records"],
+            "limitations": ["No dataset is currently available for assessment."],
+            "headline": "Dataset is insufficient for reliable operational diagnosis.",
+            "detail": "Upload a dataset containing historical operational performance evidence before diagnostic conclusions can be made.",
+        }
+
+    # 1. Entity / operational unit.
+    entity_col = _first_available_column(df, [rules["entity"]])
+    entity_cov = _coverage(df, entity_col) if entity_col else 0.0
+    entity_ok = entity_cov >= 0.70
+    items.append(_evidence_item(
+        "Entity / operational unit",
+        SUFFICIENCY_WEIGHTS["entity"],
+        entity_ok,
+        f"'{entity_col}' covers {entity_cov:.0%} of rows." if entity_col else "No partner / contractor / agent / provider identifier detected.",
+    ))
+    if not entity_ok:
+        missing.append("Entity / operational unit identifier")
+
+    # 2. Date / period.
+    date_cov = _coverage(df, "date")
+    valid_dates = pd.to_datetime(df["date"], errors="coerce").dropna() if "date" in df.columns else pd.Series(dtype="datetime64[ns]")
+    date_ok = date_cov >= 0.70 and len(valid_dates) > 0
+    items.append(_evidence_item(
+        "Date / reporting period",
+        SUFFICIENCY_WEIGHTS["date"],
+        date_ok,
+        f"Valid dates cover {date_cov:.0%} of rows." if "date" in df.columns else "No date / period field detected.",
+    ))
+    if not date_ok:
+        missing.append("Date / reporting period")
+
+    # 3. Measurable outcome. Prefer the model's primary KPI; accept a derived
+    # completion rate because normalize_dataframe() may have safely derived it.
+    primary = cfg["primary_kpi"]
+    outcome_col = _first_available_column(df, [primary, "completion_rate", "delivery_rate", "success_rate", "fulfillment_rate", "completed"])
+    outcome_cov = _coverage(df, outcome_col, numeric=True) if outcome_col else 0.0
+    outcome_ok = outcome_cov >= 0.70
+    items.append(_evidence_item(
+        "Measurable outcome",
+        SUFFICIENCY_WEIGHTS["outcome"],
+        outcome_ok,
+        f"'{outcome_col}' has numeric values in {outcome_cov:.0%} of rows." if outcome_col else f"Primary KPI '{primary}' and usable outcome measures were not detected.",
+    ))
+    if not outcome_ok:
+        missing.append(f"Measurable outcome / {primary}")
+
+    # 4. Benchmark. An explicit target/benchmark is strongest. The configured
+    # model target is a real control value, but receives partial evidence credit
+    # because it did not originate in the customer's dataset.
+    target_col = _first_available_column(df, ["target"])
+    target_cov = _coverage(df, target_col, numeric=True) if target_col else 0.0
+    if target_cov >= 0.70:
+        benchmark_points = SUFFICIENCY_WEIGHTS["benchmark"]
+        benchmark_ok = True
+        benchmark_detail = f"Explicit benchmark '{target_col}' covers {target_cov:.0%} of rows."
+    else:
+        benchmark_points = 8 if cfg.get("target") is not None else 0
+        benchmark_ok = benchmark_points > 0
+        benchmark_detail = f"No dataset benchmark detected; configured model benchmark of {cfg['target']} is available as a fallback."
+        limitations.append("Benchmark is model-configured rather than supplied in the dataset.")
+    items.append(_evidence_item(
+        "Target / benchmark",
+        SUFFICIENCY_WEIGHTS["benchmark"],
+        benchmark_ok,
+        benchmark_detail,
+    ))
+    items[-1]["points"] = benchmark_points
+    if target_cov < 0.70:
+        missing.append("Dataset target / benchmark (recommended for stronger diagnosis)")
+
+    # 5. Workload / denominator.
+    workload_col = _first_available_column(df, rules["workload"])
+    workload_cov = _coverage(df, workload_col, numeric=True) if workload_col else 0.0
+    workload_ok = workload_cov >= 0.70
+    items.append(_evidence_item(
+        "Workload / volume",
+        SUFFICIENCY_WEIGHTS["workload"],
+        workload_ok,
+        f"'{workload_col}' has numeric values in {workload_cov:.0%} of rows." if workload_col else "No workload / volume / received-work field detected.",
+    ))
+    if not workload_ok:
+        missing.append("Workload / volume / received work")
+
+    # 6. Status/result context.
+    status_col = _first_available_column(df, rules["status"])
+    status_cov = _coverage(df, status_col, numeric=(status_col in {"completed", "pending", "failure_rate", "completion_rate", "delivery_rate", "success_rate", "fulfillment_rate"})) if status_col else 0.0
+    status_ok = status_cov >= 0.70
+    items.append(_evidence_item(
+        "Status / result context",
+        SUFFICIENCY_WEIGHTS["status"],
+        status_ok,
+        f"'{status_col}' provides usable result context for {status_cov:.0%} of rows." if status_col else "No status/result/completion/pending signal detected.",
+    ))
+    if not status_ok:
+        missing.append("Status / result / completion context")
+
+    # 7. Historical depth. One static date is not enough to support a trend or
+    # recovery diagnosis. Three or more periods gets full history credit; two
+    # periods gets half.
+    unique_periods = int(valid_dates.dt.normalize().nunique()) if len(valid_dates) else 0
+    if unique_periods >= 3:
+        history_points = 10
+        history_detail = f"{unique_periods} distinct reporting periods detected."
+    elif unique_periods == 2:
+        history_points = 5
+        history_detail = "2 distinct reporting periods detected; deeper history would strengthen diagnosis."
+    else:
+        history_points = 0
+        history_detail = "Fewer than 2 valid reporting periods detected."
+    items.append(_evidence_item(
+        "Historical depth",
+        SUFFICIENCY_WEIGHTS["history"],
+        history_points > 0,
+        history_detail,
+    ))
+    if history_points < SUFFICIENCY_WEIGHTS["history"]:
+        missing.append("At least 3 reporting periods for stronger historical diagnosis")
+        limitations.append("Historical depth is limited; trend and recovery conclusions should be treated cautiously.")
+
+    raw_score = sum(item["points"] for item in items)
+    score = int(round(min(100, max(0, raw_score))))
+
+    # Green requires the evidence categories that make a partner-level
+    # diagnostic meaningful. A high numeric score alone cannot bypass these
+    # core requirements.
+    core_green = entity_ok and date_ok and outcome_ok and workload_ok and status_ok and unique_periods >= 2
+    if score >= 80 and core_green:
+        status = "GREEN"
+        headline = "Dataset contains sufficient operational signal for performance analysis and diagnostic assessment."
+        detail = "PartnerOps can proceed with full intelligence, subject to the stated benchmark and data-quality limitations."
+    elif score >= 50 and entity_ok and date_ok and outcome_ok:
+        status = "AMBER"
+        headline = "Performance can be assessed, but diagnostic depth is limited by missing evidence."
+        detail = "PartnerOps may provide limited analysis, but missing evidence must remain visible and root-cause conclusions should not be overstated."
+    else:
+        status = "RED"
+        headline = "Dataset is insufficient for reliable operational diagnosis."
+        detail = "PartnerOps will block diagnostic conclusions until additional operational evidence is supplied."
+
+    return {
+        "status": status,
+        "readiness": score,
+        "score": score,
+        "items": items,
+        "missing": missing,
+        "limitations": limitations,
+        "headline": headline,
+        "detail": detail,
+        "industry": industry,
+        "primary_kpi": primary,
+        "rows": int(len(df)),
+        "periods": unique_periods,
+    }
+
+
+def apply_sufficiency_guard(performance_df, gate):
+    """Keep the existing performance engine intact while preventing overclaiming."""
+    if performance_df is None or performance_df.empty:
+        return performance_df
+
+    result = performance_df.copy()
+    result["diagnostic_readiness"] = gate["readiness"]
+    result["diagnostic_status"] = gate["status"]
+
+    if gate["status"] == "AMBER":
+        limitation = gate["detail"]
+        result["diagnosis"] = result["diagnosis"].astype(str).apply(
+            lambda x: f"Limited diagnostic: {x} {limitation}"
+        )
+        result["recommended_action"] = "Collect the missing operational evidence before treating a root-cause or recovery action as fully validated."
+    elif gate["status"] == "RED":
+        result["diagnosis"] = "Diagnostic blocked: insufficient operational evidence."
+        result["recommended_action"] = "Collect additional historical operational data before creating a diagnostic recovery action."
+
+    return result
 
 
 # ============================================================
@@ -2106,9 +2458,12 @@ def save_snapshot(df, industry, tenant_id):
     rows = []
 
     for _, row in df.iterrows():
-        partner = str(row.get("partner", ""))
+        partner_value = row.get("partner", "")
+        if pd.isna(partner_value):
+            continue
+        partner = str(partner_value).strip()
 
-        if not partner:
+        if not partner or partner.lower() in {"nan", "none", "<na>"}:
             continue
 
         rows.append(
@@ -3574,7 +3929,14 @@ def read_partnerops_upload(upload):
                 mapped = sum(1 for col in COLUMN_ALIASES if col in normalized_sheet.columns)
                 rows = len(normalized_sheet)
                 partner_bonus = 4 if "partner" in normalized_sheet.columns else 0
-                primary_bonus = 4 if "output" in normalized_sheet.columns else 0
+                primary_kpi_for_sheet = INDUSTRIES.get(
+                    industry, {}
+                ).get("primary_kpi", "output")
+                primary_bonus = (
+                    4
+                    if primary_kpi_for_sheet in normalized_sheet.columns
+                    else 0
+                )
                 score = mapped * 10 + partner_bonus + primary_bonus + min(rows, 100) / 100
                 if best_score is None or score > best_score:
                     best_score, best_df = score, sheet_df
@@ -3635,6 +3997,11 @@ raw_df = get_current_data(
 )
 
 quality = quality_check(
+    raw_df,
+    industry,
+)
+
+sufficiency = data_sufficiency_check(
     raw_df,
     industry,
 )
@@ -3715,9 +4082,32 @@ if quality["status"] == "BLOCKED":
     st.stop()
 
 
+if sufficiency["status"] == "RED":
+    st.error(
+        f"Data-sufficiency gate is blocking diagnostic intelligence: "
+        f"{sufficiency['readiness']}% readiness."
+    )
+    st.warning(sufficiency["headline"])
+
+    if sufficiency["missing"]:
+        st.subheader("Evidence still required")
+        for item in sufficiency["missing"]:
+            st.write(f"• {item}")
+
+    st.info(
+        "Open Data Quality to review the full evidence assessment and upload "
+        "a stronger operational dataset. No diagnostic conclusions are generated from this dataset."
+    )
+    st.stop()
+
 performance_df = performance_engine(
     raw_df,
     industry,
+)
+
+performance_df = apply_sufficiency_guard(
+    performance_df,
+    sufficiency,
 )
 
 predictive_df = predictive_risk(
@@ -4519,6 +4909,77 @@ elif page == "Data Quality":
         industry,
     )
 
+    sufficiency_status = data_sufficiency_check(
+        raw_df,
+        industry,
+    )
+
+    st.subheader("Diagnostic Readiness")
+    readiness_cols = st.columns(4)
+    readiness_cols[0].metric(
+        "Readiness",
+        f"{sufficiency_status['readiness']}%",
+    )
+    readiness_cols[1].metric(
+        "Gate",
+        sufficiency_status["status"],
+    )
+    readiness_cols[2].metric(
+        "Rows",
+        sufficiency_status["rows"],
+    )
+    readiness_cols[3].metric(
+        "Periods",
+        sufficiency_status["periods"],
+    )
+
+    if sufficiency_status["status"] == "GREEN":
+        st.success(
+            f"Diagnostic Readiness: {sufficiency_status['readiness']}% — GREEN. "
+            f"{sufficiency_status['headline']}"
+        )
+    elif sufficiency_status["status"] == "AMBER":
+        st.warning(
+            f"Diagnostic Readiness: {sufficiency_status['readiness']}% — AMBER. "
+            f"{sufficiency_status['headline']}"
+        )
+    else:
+        st.error(
+            f"Diagnostic Readiness: {sufficiency_status['readiness']}% — RED. "
+            f"{sufficiency_status['headline']}"
+        )
+
+    st.caption(sufficiency_status["detail"])
+
+    evidence_df = pd.DataFrame(
+        [
+            {
+                "Evidence": item["evidence"],
+                "Points": f"{item['points']}/{item['max_points']}",
+                "Detected": "Yes" if item["available"] else "No",
+                "Assessment": item["detail"],
+            }
+            for item in sufficiency_status["items"]
+        ]
+    )
+    st.dataframe(
+        evidence_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if sufficiency_status["missing"]:
+        st.subheader("Evidence gaps")
+        for item in sufficiency_status["missing"]:
+            st.write(f"• {item}")
+
+    if sufficiency_status["limitations"]:
+        st.subheader("Diagnostic limitations")
+        for item in sufficiency_status["limitations"]:
+            st.warning(item)
+
+    st.divider()
+
     if status["status"] == "GOOD":
         st.success(
             "Dataset passed the data-quality gate."
@@ -4591,6 +5052,10 @@ elif page == "Data Quality":
                     normalized,
                     industry,
                 )
+                sq = data_sufficiency_check(
+                    normalized,
+                    industry,
+                )
 
                 summary = ingestion_summary(
                     uploaded_df,
@@ -4599,8 +5064,10 @@ elif page == "Data Quality":
                 )
 
                 st.write(
-                    f"Quality status: **{q['status']}**"
+                    f"Quality status: **{q['status']}** · "
+                    f"Diagnostic readiness: **{sq['readiness']}% — {sq['status']}**"
                 )
+                st.caption(sq["headline"])
                 st.caption(
                     f"{summary['filename']} · "
                     f"{summary['source_rows']:,} source row(s) · "
@@ -5235,13 +5702,45 @@ elif page == "Administration":
             fetch=True,
         )
 
+        active_links_df = pd.DataFrame(
+            [dict(r) for r in rows]
+        )
         st.dataframe(
-            pd.DataFrame(
-                [dict(r) for r in rows]
-            ),
+            active_links_df,
             use_container_width=True,
             hide_index=True,
         )
+
+        st.subheader("Revoke a single access link")
+        link_ids = [int(row["link_id"]) for row in rows if row["active"]]
+        if link_ids:
+            revoke_id = st.selectbox(
+                "Active link",
+                link_ids,
+                key="revoke_access_link_id",
+            )
+            if st.button(
+                "Revoke Selected Link",
+                use_container_width=True,
+            ):
+                db_execute(
+                    """
+                    UPDATE access_links
+                    SET active = 0, revoked_at = ?
+                    WHERE link_id = ? AND active = 1
+                    """,
+                    (utc_iso(), revoke_id),
+                )
+                audit(
+                    "ACCESS_LINK_REVOKED",
+                    "access_link",
+                    revoke_id,
+                    {"reason": "manual_revoke"},
+                )
+                st.success("Selected access link revoked.")
+                st.rerun()
+        else:
+            st.info("No active access links to revoke.")
 
     # --------------------------------------------------------
     # USERS
