@@ -870,11 +870,48 @@ def module_enabled(tenant_id, module_key):
     return bool(rows and rows[0]["enabled"])
 
 
+# Initialize the contract-intelligence schema before any module entitlement
+# queries or default-module seeding. This is required on a fresh deployment
+# as well as on an upgraded 5.2.x database.
+init_contract_db()
+
+
 def ensure_default_modules():
+    """Ensure module-entitlement storage exists before seeding tenant defaults.
+
+    This is intentionally defensive because Streamlit Cloud may start against
+    an existing SQLite file created by an earlier application revision.
+    The function must therefore be safe even if the contract schema bootstrap
+    was interrupted or the database was created by a pre-CMS version.
+    """
+    db_execute(
+        """
+        CREATE TABLE IF NOT EXISTS tenant_modules (
+            tenant_id TEXT NOT NULL,
+            module_key TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            PRIMARY KEY (tenant_id, module_key)
+        )
+        """
+    )
+
+    db_execute(
+        "CREATE INDEX IF NOT EXISTS idx_tenant_modules_tenant ON tenant_modules(tenant_id)"
+    )
+
     tenants = db_execute("SELECT tenant_id FROM tenants", fetch=True)
-    for row in tenants:
-        for module_key in ("partner_performance", "contract_intelligence"):
-            db_execute("INSERT OR IGNORE INTO tenant_modules(tenant_id, module_key, enabled) VALUES (?, ?, 1)", (row["tenant_id"], module_key))
+    if not tenants:
+        return
+
+    db_execute(
+        "INSERT OR IGNORE INTO tenant_modules(tenant_id, module_key, enabled) VALUES (?, ?, 1)",
+        [
+            (row["tenant_id"], module_key)
+            for row in tenants
+            for module_key in ("partner_performance", "contract_intelligence")
+        ],
+        many=True,
+    )
 
 
 ensure_default_modules()
