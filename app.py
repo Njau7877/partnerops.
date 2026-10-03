@@ -66,6 +66,12 @@ import pandas as pd
 import streamlit as st
 
 try:
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:
+    Fernet = None
+    InvalidToken = Exception
+
+try:
     from PIL import Image
 except Exception:
     Image = None
@@ -91,7 +97,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.2.0 Security & Production Hardened + Sufficiency Gate"
+APP_VERSION = "5.3.0 Contract Intelligence & Commercial Control"
 
 
 def get_config_value(name, default=None):
@@ -167,6 +173,13 @@ PRODUCTION_MODE = str(
     get_config_value("PARTNEROPS_PRODUCTION", "false")
 ).lower() == "true"
 
+# Contract documents contain potentially sensitive legal/commercial data.
+# The encryption key is defined during the security bootstrap so production
+# validation cannot reference a variable that has not yet been initialized.
+CONTRACT_DOCUMENT_ENCRYPTION_KEY = get_config_value(
+    "PARTNEROPS_DOCUMENT_ENCRYPTION_KEY", ""
+)
+
 PBKDF2_ITERATIONS = 210_000
 
 logging.basicConfig(level=logging.INFO)
@@ -197,14 +210,16 @@ def security_configuration_ok():
         or INITIAL_ADMIN_PASSWORD == "CHANGE_THIS_ADMIN_PASSWORD"
     )
 
-    return not unsafe_secret and not unsafe_password
+    unsafe_document_key = PRODUCTION_MODE and (not CONTRACT_DOCUMENT_ENCRYPTION_KEY or Fernet is None)
+
+    return not unsafe_secret and not unsafe_password and not unsafe_document_key
 
 
 if PRODUCTION_MODE and not security_configuration_ok():
     st.error(
         "PartnerOps is configured for production but secure secrets have not "
-        "been configured. Set PARTNEROPS_ACCESS_SECRET and "
-        "PARTNEROPS_INITIAL_ADMIN_PASSWORD."
+        "been configured. Set PARTNEROPS_ACCESS_SECRET, "
+        "PARTNEROPS_INITIAL_ADMIN_PASSWORD, and PARTNEROPS_DOCUMENT_ENCRYPTION_KEY for production contract storage."
     )
     st.stop()
 
@@ -527,21 +542,19 @@ def get_db():
 def db_execute(sql, params=(), fetch=False, many=False):
     conn = get_db()
     cur = conn.cursor()
-
-    if many:
-        cur.executemany(sql, params)
-    else:
-        cur.execute(sql, params)
-
-    result = None
-
-    if fetch:
-        result = cur.fetchall()
-
-    conn.commit()
-    conn.close()
-
-    return result
+    try:
+        if many:
+            cur.executemany(sql, params)
+        else:
+            cur.execute(sql, params)
+        result = cur.fetchall() if fetch else None
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -680,6 +693,375 @@ def init_db():
 
 
 init_db()
+
+
+# ============================================================
+# 5A. CONTRACT MANAGEMENT DATA LAYER
+# ============================================================
+
+CONTRACT_DOCUMENT_MAX_BYTES = 10 * 1024 * 1024
+CONTRACT_STATUSES = ["Draft", "Active", "Expiring", "Expired", "Terminated", "Renewal Pending"]
+CONTRACT_RISK_LEVELS = ["Low", "Medium", "High", "Critical"]
+OBLIGATION_STATUSES = ["Open", "On Track", "At Risk", "Breached", "Completed", "Waived"]
+SLA_DIRECTIONS = ["higher_is_better", "lower_is_better"]
+
+
+def init_contract_db():
+    """Create the contract intelligence layer without changing existing PartnerOps tables."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tenant_modules (
+            tenant_id TEXT NOT NULL,
+            module_key TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            PRIMARY KEY (tenant_id, module_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS contracts (
+            contract_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            contract_number TEXT NOT NULL,
+            title TEXT NOT NULL,
+            counterparty TEXT NOT NULL,
+            partner_name TEXT,
+            industry TEXT,
+            contract_type TEXT,
+            status TEXT DEFAULT 'Draft',
+            start_date TEXT,
+            end_date TEXT,
+            auto_renew INTEGER DEFAULT 0,
+            notice_days INTEGER DEFAULT 30,
+            currency TEXT DEFAULT 'KES',
+            contract_value REAL DEFAULT 0,
+            owner TEXT,
+            governing_law TEXT,
+            risk_level TEXT DEFAULT 'Medium',
+            summary TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(tenant_id, contract_number)
+        );
+
+        CREATE TABLE IF NOT EXISTS contract_obligations (
+            obligation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            contract_id INTEGER NOT NULL,
+            obligation_title TEXT NOT NULL,
+            description TEXT,
+            responsible_party TEXT NOT NULL,
+            owner TEXT,
+            due_date TEXT,
+            recurrence TEXT,
+            target_value REAL,
+            unit TEXT,
+            evidence_required TEXT,
+            status TEXT DEFAULT 'Open',
+            risk_level TEXT DEFAULT 'Medium',
+            value_at_risk REAL DEFAULT 0,
+            last_completed_date TEXT,
+            next_due_date TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS contract_slas (
+            sla_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            contract_id INTEGER NOT NULL,
+            sla_name TEXT NOT NULL,
+            metric_name TEXT NOT NULL,
+            target_value REAL NOT NULL,
+            direction TEXT DEFAULT 'higher_is_better',
+            unit TEXT DEFAULT '%',
+            measurement_period TEXT DEFAULT 'Monthly',
+            grace_period_days INTEGER DEFAULT 0,
+            penalty_rate REAL DEFAULT 0,
+            current_value REAL,
+            status TEXT DEFAULT 'Not Measured',
+            breach_count INTEGER DEFAULT 0,
+            last_measured_at TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS contract_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            contract_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            owner TEXT,
+            status TEXT DEFAULT 'Open',
+            created_by TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS contract_documents (
+            document_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            contract_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            mime_type TEXT,
+            file_size INTEGER DEFAULT 0,
+            sha256 TEXT NOT NULL,
+            content BLOB,
+            uploaded_by TEXT,
+            uploaded_at TEXT NOT NULL,
+            FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS contract_reviews (
+            review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            contract_id INTEGER NOT NULL,
+            review_type TEXT NOT NULL,
+            review_date TEXT NOT NULL,
+            reviewer TEXT NOT NULL,
+            result TEXT NOT NULL,
+            findings TEXT,
+            remediation TEXT,
+            status TEXT DEFAULT 'Open',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_contracts_tenant_status ON contracts(tenant_id, status);
+        CREATE INDEX IF NOT EXISTS idx_contracts_tenant_end ON contracts(tenant_id, end_date);
+        CREATE INDEX IF NOT EXISTS idx_contract_obligations_contract ON contract_obligations(contract_id, status);
+        CREATE INDEX IF NOT EXISTS idx_contract_slas_contract ON contract_slas(contract_id, status);
+        CREATE INDEX IF NOT EXISTS idx_contract_events_contract ON contract_events(contract_id, event_date);
+        CREATE INDEX IF NOT EXISTS idx_contract_documents_contract ON contract_documents(contract_id);
+        CREATE INDEX IF NOT EXISTS idx_contract_reviews_contract ON contract_reviews(contract_id, review_date);
+        """
+    )
+
+    # Cross-module traceability: contract recovery actions must remain linked
+    # to the originating contract/obligation while remaining tenant-scoped.
+    existing_intervention = {row[1] for row in cur.execute("PRAGMA table_info(interventions)").fetchall()}
+    if "contract_id" not in existing_intervention:
+        cur.execute("ALTER TABLE interventions ADD COLUMN contract_id INTEGER")
+    if "obligation_id" not in existing_intervention:
+        cur.execute("ALTER TABLE interventions ADD COLUMN obligation_id INTEGER")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_interventions_contract ON interventions(tenant_id, contract_id, obligation_id)")
+
+    # Forward-compatible migration for contracts created before industry scoping.
+    existing_contract_columns = {row[1] for row in cur.execute("PRAGMA table_info(contracts)").fetchall()}
+    if "industry" not in existing_contract_columns:
+        cur.execute("ALTER TABLE contracts ADD COLUMN industry TEXT")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_contracts_tenant_industry ON contracts(tenant_id, industry)")
+
+    conn.commit()
+    conn.close()
+
+
+def module_enabled(tenant_id, module_key):
+    rows = db_execute(
+        "SELECT enabled FROM tenant_modules WHERE tenant_id = ? AND module_key = ?",
+        (tenant_id, module_key), fetch=True
+    )
+    return bool(rows and rows[0]["enabled"])
+
+
+def ensure_default_modules():
+    tenants = db_execute("SELECT tenant_id FROM tenants", fetch=True)
+    for row in tenants:
+        for module_key in ("partner_performance", "contract_intelligence"):
+            db_execute("INSERT OR IGNORE INTO tenant_modules(tenant_id, module_key, enabled) VALUES (?, ?, 1)", (row["tenant_id"], module_key))
+
+
+ensure_default_modules()
+
+
+def _contract_scope_clause():
+    return (st.session_state.get("tenant_id"),)
+
+
+def _contract_date(value):
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()[:10]
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return parsed.date().isoformat()
+
+
+def _contract_days_remaining(end_date):
+    if not end_date:
+        return None
+    try:
+        return (date.fromisoformat(str(end_date)[:10]) - utc_now().date()).days
+    except Exception:
+        return None
+
+
+def _contract_status_from_dates(start_date, end_date, current_status=None):
+    if current_status in {"Draft", "Terminated", "Renewal Pending"}:
+        return current_status
+    today = utc_now().date()
+    try:
+        start = date.fromisoformat(str(start_date)[:10]) if start_date else None
+        end = date.fromisoformat(str(end_date)[:10]) if end_date else None
+    except Exception:
+        return current_status or "Draft"
+    if end and end < today:
+        return "Expired"
+    if end and (end - today).days <= 90:
+        return "Expiring"
+    if start and start > today:
+        return "Draft"
+    return "Active"
+
+
+def _sla_is_breached(current_value, target_value, direction):
+    if current_value is None or target_value is None:
+        return False
+    if direction == "lower_is_better":
+        return float(current_value) > float(target_value)
+    return float(current_value) < float(target_value)
+
+
+def _contract_performance_score(contract_id):
+    obligations = db_execute(
+        "SELECT status, risk_level FROM contract_obligations WHERE tenant_id = ? AND contract_id = ?",
+        (st.session_state.tenant_id, contract_id), fetch=True
+    )
+    slas = db_execute(
+        "SELECT current_value, target_value, direction, status FROM contract_slas WHERE tenant_id = ? AND contract_id = ?",
+        (st.session_state.tenant_id, contract_id), fetch=True
+    )
+    points = []
+    for row in obligations:
+        status = row["status"]
+        points.append({"Completed": 100, "On Track": 100, "Open": 80, "At Risk": 50, "Breached": 0, "Waived": 100}.get(status, 70))
+    for row in slas:
+        if row["current_value"] is None:
+            points.append(70)
+        elif _sla_is_breached(row["current_value"], row["target_value"], row["direction"]):
+            points.append(0)
+        else:
+            points.append(100)
+    return round(sum(points) / len(points), 1) if points else None
+
+
+def contract_summary_df():
+    rows = db_execute(
+        """SELECT * FROM contracts WHERE tenant_id = ? ORDER BY end_date IS NULL, end_date, contract_id DESC""",
+        (st.session_state.tenant_id,), fetch=True
+    )
+    records = []
+    for r in rows:
+        d = dict(r)
+        d["days_remaining"] = _contract_days_remaining(d.get("end_date"))
+        d["performance_score"] = _contract_performance_score(d["contract_id"])
+        d["industry"] = d.get("industry") or "Unassigned"
+        records.append(d)
+    return pd.DataFrame(records)
+
+
+def contract_detail(contract_id):
+    rows = db_execute(
+        "SELECT * FROM contracts WHERE tenant_id = ? AND contract_id = ?",
+        (st.session_state.tenant_id, contract_id), fetch=True
+    )
+    return dict(rows[0]) if rows else None
+
+
+def _require_contract_write():
+    if st.session_state.get("access_mode") == "customer" or not has_permission("actions"):
+        st.error("Contract management changes require an authorized platform user.")
+        return False
+    return True
+
+
+def _contract_value_at_risk(contract_id):
+    obligations = db_execute(
+        "SELECT COALESCE(SUM(value_at_risk),0) AS v FROM contract_obligations WHERE tenant_id = ? AND contract_id = ? AND status IN ('At Risk','Breached')",
+        (st.session_state.tenant_id, contract_id), fetch=True
+    )
+    return float(obligations[0]["v"] or 0) if obligations else 0.0
+
+
+def _create_contract_action(contract_id, title, owner, priority, due_date, value_at_risk, obligation_id=None):
+    contract = contract_detail(contract_id)
+    if not contract:
+        raise ValueError("Contract not found in the current tenant.")
+    partner = contract.get("partner_name") or contract.get("counterparty")
+    db_execute(
+        """INSERT INTO interventions
+        (tenant_id, industry, partner, action, owner, status, priority, target_outcome, due_date, estimated_value, contract_id, obligation_id, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, 'Open', ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (st.session_state.tenant_id, st.session_state.current_industry, partner, title, owner, priority, "Contract obligation/SLA recovery", _contract_date(due_date), value_at_risk, contract_id, obligation_id, st.session_state.username, utc_iso())
+    )
+    audit("CONTRACT_ACTION_CREATED", "contract", contract_id, {"title": title, "owner": owner, "priority": priority, "due_date": due_date, "obligation_id": obligation_id, "value_at_risk": value_at_risk})
+
+
+def _refresh_contract_sla(sla_id):
+    rows = db_execute(
+        """SELECT s.*, c.industry AS contract_industry
+           FROM contract_slas s
+           JOIN contracts c ON c.contract_id = s.contract_id AND c.tenant_id = s.tenant_id
+          WHERE s.tenant_id = ? AND s.sla_id = ?""",
+        (st.session_state.tenant_id, sla_id), fetch=True
+    )
+    if not rows:
+        return None
+    sla = dict(rows[0])
+    contract_industry = sla.get("contract_industry") or st.session_state.current_industry
+    df = get_current_data(contract_industry)
+    metric = sla["metric_name"]
+    if df.empty or metric not in df.columns:
+        return {"status": "Not Measured", "value": None}
+    values = pd.to_numeric(df[metric], errors="coerce").dropna()
+    if values.empty:
+        return {"status": "Not Measured", "value": None}
+    value = float(values.mean())
+    breached = _sla_is_breached(value, sla["target_value"], sla["direction"])
+    status = "Breached" if breached else "Compliant"
+    db_execute(
+        """UPDATE contract_slas SET current_value = ?, status = ?, last_measured_at = ?, breach_count = CASE WHEN ? = 'Breached' THEN breach_count + 1 ELSE breach_count END WHERE tenant_id = ? AND sla_id = ?""",
+        (value, status, utc_iso(), status, st.session_state.tenant_id, sla_id)
+    )
+    return {"status": status, "value": value}
+
+
+def _document_cipher():
+    if not CONTRACT_DOCUMENT_ENCRYPTION_KEY:
+        return None
+    if Fernet is None:
+        raise RuntimeError("cryptography is required when document encryption is configured.")
+    try:
+        return Fernet(CONTRACT_DOCUMENT_ENCRYPTION_KEY.encode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("PARTNEROPS_DOCUMENT_ENCRYPTION_KEY must be a valid Fernet key.") from exc
+
+
+def _encrypt_contract_document(raw):
+    cipher = _document_cipher()
+    if cipher is None:
+        raise RuntimeError(
+            "Contract document storage is disabled until PARTNEROPS_DOCUMENT_ENCRYPTION_KEY is configured."
+        )
+    return cipher.encrypt(raw)
+
+
+def _decrypt_contract_document(blob):
+    cipher = _document_cipher()
+    if cipher is None:
+        return bytes(blob)
+    try:
+        return cipher.decrypt(bytes(blob))
+    except InvalidToken as exc:
+        raise RuntimeError("Contract document could not be decrypted with the configured key.") from exc
 
 
 # ============================================================
@@ -1514,55 +1896,6 @@ COLUMN_ALIASES = {
         "timestamp",
         "created_at",
     ],
-    # Evidence fields used by the Data Sufficiency Gate. These are additive
-    # aliases; existing performance-engine fields remain unchanged.
-    "target": [
-        "target",
-        "benchmark",
-        "target_rate",
-        "target_pct",
-        "sla_target",
-        "service_target",
-    ],
-    "workload": [
-        "workload",
-        "volume",
-        "jobs",
-        "orders",
-        "cases",
-        "cases_received",
-        "requests",
-        "tickets",
-        "visits",
-        "transactions",
-        "units",
-        "total_jobs",
-        "total_orders",
-        "received",
-    ],
-    "status": [
-        "status",
-        "result",
-        "outcome",
-        "state",
-        "disposition",
-    ],
-    "sla": [
-        "sla",
-        "sla_status",
-        "service_level",
-        "service_level_status",
-        "on_time",
-        "on_time_rate",
-    ],
-    "turnaround": [
-        "turnaround",
-        "turnaround_time",
-        "turnaround_days",
-        "tat",
-        "processing_time",
-        "resolution_time",
-    ],
 }
 
 
@@ -1851,309 +2184,6 @@ def quality_check(df, industry):
         "columns": len(df.columns),
         "duplicates": duplicates,
     }
-
-
-# ============================================================
-# 15. DATA SUFFICIENCY GATE
-# ============================================================
-#
-# This is intentionally separate from quality_check(). Data quality answers
-# "Can we safely read/use this dataset?" Data sufficiency answers
-# "Does this dataset contain enough operational evidence to support the
-# diagnostic claims PartnerOps is about to make?"
-#
-# The gate is conservative: it never invents evidence, targets, history or
-# root causes. It sits in front of the existing intelligence engine and is
-# additive to the 5.2.0 workflow.
-
-SUFFICIENCY_EVIDENCE = {
-    "Telecom / ISP / OSP": {
-        "entity": "partner",
-        "workload": ["workload", "output", "completed"],
-        "status": ["status", "completed", "pending", "failure_rate", "completion_rate"],
-        "context": ["quality", "productivity", "sla", "turnaround", "pending", "aging"],
-    },
-    "Logistics / Delivery": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "delivery_rate", "failure_rate"],
-        "context": ["sla", "turnaround", "aging", "quality"],
-    },
-    "Field Service / Contractors": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "completion_rate"],
-        "context": ["sla", "turnaround", "quality", "aging", "productivity"],
-    },
-    "Distribution / FMCG": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "fulfillment_rate", "failure_rate"],
-        "context": ["sla", "turnaround", "quality", "aging"],
-    },
-    "Banking / Fintech / Agents": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "success_rate", "failure_rate"],
-        "context": ["sla", "turnaround", "quality", "aging"],
-    },
-    "Energy / Utilities": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
-        "context": ["sla", "turnaround", "quality", "aging", "productivity"],
-    },
-    "Insurance": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
-        "context": ["sla", "turnaround", "quality", "aging"],
-    },
-    "Construction": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
-        "context": ["sla", "turnaround", "quality", "aging", "productivity"],
-    },
-    "Healthcare": {
-        "entity": "partner",
-        "workload": ["workload", "output"],
-        "status": ["status", "completed", "pending", "completion_rate", "failure_rate"],
-        "context": ["sla", "turnaround", "quality", "aging"],
-    },
-}
-
-SUFFICIENCY_WEIGHTS = {
-    "entity": 15,
-    "date": 15,
-    "outcome": 20,
-    "benchmark": 15,
-    "workload": 15,
-    "status": 10,
-    "history": 10,
-}
-
-
-def _coverage(df, column, numeric=False):
-    if df is None or df.empty or column not in df.columns:
-        return 0.0
-    series = df[column]
-    if numeric:
-        series = pd.to_numeric(series, errors="coerce")
-    else:
-        series = series.astype(str).str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
-    return float(series.notna().mean())
-
-
-def _first_available_column(df, candidates):
-    if df is None:
-        return None
-    for column in candidates:
-        if column in df.columns:
-            return column
-    return None
-
-
-def _evidence_item(label, points, available, detail):
-    return {
-        "evidence": label,
-        "points": points if available else 0,
-        "max_points": points,
-        "available": bool(available),
-        "detail": detail,
-    }
-
-
-def data_sufficiency_check(df, industry):
-    """Assess whether the selected operational model has enough evidence for diagnosis."""
-    cfg = INDUSTRIES[industry]
-    rules = SUFFICIENCY_EVIDENCE.get(industry, SUFFICIENCY_EVIDENCE["Telecom / ISP / OSP"])
-    items = []
-    missing = []
-    limitations = []
-
-    if df is None or df.empty:
-        return {
-            "status": "RED",
-            "readiness": 0,
-            "score": 0,
-            "items": [],
-            "missing": ["Operational records"],
-            "limitations": ["No dataset is currently available for assessment."],
-            "headline": "Dataset is insufficient for reliable operational diagnosis.",
-            "detail": "Upload a dataset containing historical operational performance evidence before diagnostic conclusions can be made.",
-        }
-
-    # 1. Entity / operational unit.
-    entity_col = _first_available_column(df, [rules["entity"]])
-    entity_cov = _coverage(df, entity_col) if entity_col else 0.0
-    entity_ok = entity_cov >= 0.70
-    items.append(_evidence_item(
-        "Entity / operational unit",
-        SUFFICIENCY_WEIGHTS["entity"],
-        entity_ok,
-        f"'{entity_col}' covers {entity_cov:.0%} of rows." if entity_col else "No partner / contractor / agent / provider identifier detected.",
-    ))
-    if not entity_ok:
-        missing.append("Entity / operational unit identifier")
-
-    # 2. Date / period.
-    date_cov = _coverage(df, "date")
-    valid_dates = pd.to_datetime(df["date"], errors="coerce").dropna() if "date" in df.columns else pd.Series(dtype="datetime64[ns]")
-    date_ok = date_cov >= 0.70 and len(valid_dates) > 0
-    items.append(_evidence_item(
-        "Date / reporting period",
-        SUFFICIENCY_WEIGHTS["date"],
-        date_ok,
-        f"Valid dates cover {date_cov:.0%} of rows." if "date" in df.columns else "No date / period field detected.",
-    ))
-    if not date_ok:
-        missing.append("Date / reporting period")
-
-    # 3. Measurable outcome. Prefer the model's primary KPI; accept a derived
-    # completion rate because normalize_dataframe() may have safely derived it.
-    primary = cfg["primary_kpi"]
-    outcome_col = _first_available_column(df, [primary, "completion_rate", "delivery_rate", "success_rate", "fulfillment_rate", "completed"])
-    outcome_cov = _coverage(df, outcome_col, numeric=True) if outcome_col else 0.0
-    outcome_ok = outcome_cov >= 0.70
-    items.append(_evidence_item(
-        "Measurable outcome",
-        SUFFICIENCY_WEIGHTS["outcome"],
-        outcome_ok,
-        f"'{outcome_col}' has numeric values in {outcome_cov:.0%} of rows." if outcome_col else f"Primary KPI '{primary}' and usable outcome measures were not detected.",
-    ))
-    if not outcome_ok:
-        missing.append(f"Measurable outcome / {primary}")
-
-    # 4. Benchmark. An explicit target/benchmark is strongest. The configured
-    # model target is a real control value, but receives partial evidence credit
-    # because it did not originate in the customer's dataset.
-    target_col = _first_available_column(df, ["target"])
-    target_cov = _coverage(df, target_col, numeric=True) if target_col else 0.0
-    if target_cov >= 0.70:
-        benchmark_points = SUFFICIENCY_WEIGHTS["benchmark"]
-        benchmark_ok = True
-        benchmark_detail = f"Explicit benchmark '{target_col}' covers {target_cov:.0%} of rows."
-    else:
-        benchmark_points = 8 if cfg.get("target") is not None else 0
-        benchmark_ok = benchmark_points > 0
-        benchmark_detail = f"No dataset benchmark detected; configured model benchmark of {cfg['target']} is available as a fallback."
-        limitations.append("Benchmark is model-configured rather than supplied in the dataset.")
-    items.append(_evidence_item(
-        "Target / benchmark",
-        SUFFICIENCY_WEIGHTS["benchmark"],
-        benchmark_ok,
-        benchmark_detail,
-    ))
-    items[-1]["points"] = benchmark_points
-    if target_cov < 0.70:
-        missing.append("Dataset target / benchmark (recommended for stronger diagnosis)")
-
-    # 5. Workload / denominator.
-    workload_col = _first_available_column(df, rules["workload"])
-    workload_cov = _coverage(df, workload_col, numeric=True) if workload_col else 0.0
-    workload_ok = workload_cov >= 0.70
-    items.append(_evidence_item(
-        "Workload / volume",
-        SUFFICIENCY_WEIGHTS["workload"],
-        workload_ok,
-        f"'{workload_col}' has numeric values in {workload_cov:.0%} of rows." if workload_col else "No workload / volume / received-work field detected.",
-    ))
-    if not workload_ok:
-        missing.append("Workload / volume / received work")
-
-    # 6. Status/result context.
-    status_col = _first_available_column(df, rules["status"])
-    status_cov = _coverage(df, status_col, numeric=(status_col in {"completed", "pending", "failure_rate", "completion_rate", "delivery_rate", "success_rate", "fulfillment_rate"})) if status_col else 0.0
-    status_ok = status_cov >= 0.70
-    items.append(_evidence_item(
-        "Status / result context",
-        SUFFICIENCY_WEIGHTS["status"],
-        status_ok,
-        f"'{status_col}' provides usable result context for {status_cov:.0%} of rows." if status_col else "No status/result/completion/pending signal detected.",
-    ))
-    if not status_ok:
-        missing.append("Status / result / completion context")
-
-    # 7. Historical depth. One static date is not enough to support a trend or
-    # recovery diagnosis. Three or more periods gets full history credit; two
-    # periods gets half.
-    unique_periods = int(valid_dates.dt.normalize().nunique()) if len(valid_dates) else 0
-    if unique_periods >= 3:
-        history_points = 10
-        history_detail = f"{unique_periods} distinct reporting periods detected."
-    elif unique_periods == 2:
-        history_points = 5
-        history_detail = "2 distinct reporting periods detected; deeper history would strengthen diagnosis."
-    else:
-        history_points = 0
-        history_detail = "Fewer than 2 valid reporting periods detected."
-    items.append(_evidence_item(
-        "Historical depth",
-        SUFFICIENCY_WEIGHTS["history"],
-        history_points > 0,
-        history_detail,
-    ))
-    if history_points < SUFFICIENCY_WEIGHTS["history"]:
-        missing.append("At least 3 reporting periods for stronger historical diagnosis")
-        limitations.append("Historical depth is limited; trend and recovery conclusions should be treated cautiously.")
-
-    raw_score = sum(item["points"] for item in items)
-    score = int(round(min(100, max(0, raw_score))))
-
-    # Green requires the evidence categories that make a partner-level
-    # diagnostic meaningful. A high numeric score alone cannot bypass these
-    # core requirements.
-    core_green = entity_ok and date_ok and outcome_ok and workload_ok and status_ok and unique_periods >= 2
-    if score >= 80 and core_green:
-        status = "GREEN"
-        headline = "Dataset contains sufficient operational signal for performance analysis and diagnostic assessment."
-        detail = "PartnerOps can proceed with full intelligence, subject to the stated benchmark and data-quality limitations."
-    elif score >= 50 and entity_ok and date_ok and outcome_ok:
-        status = "AMBER"
-        headline = "Performance can be assessed, but diagnostic depth is limited by missing evidence."
-        detail = "PartnerOps may provide limited analysis, but missing evidence must remain visible and root-cause conclusions should not be overstated."
-    else:
-        status = "RED"
-        headline = "Dataset is insufficient for reliable operational diagnosis."
-        detail = "PartnerOps will block diagnostic conclusions until additional operational evidence is supplied."
-
-    return {
-        "status": status,
-        "readiness": score,
-        "score": score,
-        "items": items,
-        "missing": missing,
-        "limitations": limitations,
-        "headline": headline,
-        "detail": detail,
-        "industry": industry,
-        "primary_kpi": primary,
-        "rows": int(len(df)),
-        "periods": unique_periods,
-    }
-
-
-def apply_sufficiency_guard(performance_df, gate):
-    """Keep the existing performance engine intact while preventing overclaiming."""
-    if performance_df is None or performance_df.empty:
-        return performance_df
-
-    result = performance_df.copy()
-    result["diagnostic_readiness"] = gate["readiness"]
-    result["diagnostic_status"] = gate["status"]
-
-    if gate["status"] == "AMBER":
-        limitation = gate["detail"]
-        result["diagnosis"] = result["diagnosis"].astype(str).apply(
-            lambda x: f"Limited diagnostic: {x} {limitation}"
-        )
-        result["recommended_action"] = "Collect the missing operational evidence before treating a root-cause or recovery action as fully validated."
-    elif gate["status"] == "RED":
-        result["diagnosis"] = "Diagnostic blocked: insufficient operational evidence."
-        result["recommended_action"] = "Collect additional historical operational data before creating a diagnostic recovery action."
-
-    return result
 
 
 # ============================================================
@@ -2458,12 +2488,9 @@ def save_snapshot(df, industry, tenant_id):
     rows = []
 
     for _, row in df.iterrows():
-        partner_value = row.get("partner", "")
-        if pd.isna(partner_value):
-            continue
-        partner = str(partner_value).strip()
+        partner = str(row.get("partner", ""))
 
-        if not partner or partner.lower() in {"nan", "none", "<na>"}:
+        if not partner:
             continue
 
         rows.append(
@@ -3604,6 +3631,10 @@ if st.session_state.access_mode == "customer":
         "Customer Report",
         "Export",
     ]
+    if not module_enabled(st.session_state.get("tenant_id"), "partner_performance"):
+        page_options = []
+    if module_enabled(st.session_state.get("tenant_id"), "contract_intelligence"):
+        page_options.append("Contract Management")
 else:
     page_options = [
         "Command Center",
@@ -3622,6 +3653,10 @@ else:
         "Export",
         "Administration",
     ]
+    if not module_enabled(st.session_state.get("tenant_id"), "partner_performance"):
+        page_options = [p for p in page_options if p in ("Administration", "Contract Management")]
+    if module_enabled(st.session_state.get("tenant_id"), "contract_intelligence"):
+        page_options.insert(-1, "Contract Management")
 
 page = st.sidebar.radio(
     "Workspace",
@@ -3929,14 +3964,7 @@ def read_partnerops_upload(upload):
                 mapped = sum(1 for col in COLUMN_ALIASES if col in normalized_sheet.columns)
                 rows = len(normalized_sheet)
                 partner_bonus = 4 if "partner" in normalized_sheet.columns else 0
-                primary_kpi_for_sheet = INDUSTRIES.get(
-                    industry, {}
-                ).get("primary_kpi", "output")
-                primary_bonus = (
-                    4
-                    if primary_kpi_for_sheet in normalized_sheet.columns
-                    else 0
-                )
+                primary_bonus = 4 if "output" in normalized_sheet.columns else 0
                 score = mapped * 10 + partner_bonus + primary_bonus + min(rows, 100) / 100
                 if best_score is None or score > best_score:
                     best_score, best_df = score, sheet_df
@@ -3992,144 +4020,463 @@ def ingestion_summary(
 # 27. LOAD + PROCESS DATA
 # ============================================================
 
-raw_df = get_current_data(
-    industry
-)
+if page == "Contract Management":
+    # CMS is independently operable. It must not require an operational
+    # performance dataset merely to open the contract workspace.
+    raw_df = pd.DataFrame()
+    performance_df = pd.DataFrame()
+    predictive_df = pd.DataFrame()
+    anomalies_df = pd.DataFrame()
+else:
+    raw_df = get_current_data(industry)
 
-quality = quality_check(
-    raw_df,
-    industry,
-)
-
-sufficiency = data_sufficiency_check(
-    raw_df,
-    industry,
-)
-
-if quality["status"] == "BLOCKED":
-    st.error(
-        "Data-quality gate is blocking intelligence."
+    quality = quality_check(
+        raw_df,
+        industry,
     )
 
-    for issue in quality["issues"]:
-        st.error(issue)
-
-    if has_permission("upload"):
-        upload = st.file_uploader(
-            "Upload operational data",
-            type=SUPPORTED_UPLOAD_TYPES,
-            help=(
-                f"CSV, Excel, JSON, TXT, PDF, DOCX, PNG or JPG. "
-                f"Maximum {MAX_UPLOAD_MB} MB."
-            ),
+    if quality["status"] == "BLOCKED":
+        st.error(
+            "Data-quality gate is blocking intelligence."
         )
 
-        if upload:
-            try:
-                uploaded_df = read_partnerops_upload(upload)
-                normalized = normalize_dataframe(uploaded_df)
-                q = quality_check(
-                    normalized,
-                    industry,
-                )
+        for issue in quality["issues"]:
+            st.error(issue)
 
-                st.caption(
-                    f"Detected: {upload.name} · "
-                    f"{len(uploaded_df):,} source row(s) · "
-                    f"{len(normalized.columns):,} normalized column(s)"
-                )
+        if has_permission("upload"):
+            upload = st.file_uploader(
+                "Upload operational data",
+                type=SUPPORTED_UPLOAD_TYPES,
+                help=(
+                    f"CSV, Excel, JSON, TXT, PDF, DOCX, PNG or JPG. "
+                    f"Maximum {MAX_UPLOAD_MB} MB."
+                ),
+            )
 
-                st.dataframe(
-                    normalized.head(20),
-                    use_container_width=True,
-                )
-
-                if q["status"] != "BLOCKED":
-                    if st.button(
-                        "Accept Dataset",
-                        key="blocked_upload_accept",
-                    ):
-                        ok, q2 = set_current_data(
-                            uploaded_df,
-                            industry,
-                            upload.name,
-                        )
-
-                        if ok:
-                            st.success(
-                                "Dataset accepted and saved."
-                            )
-                            st.rerun()
-                        else:
-                            st.error(
-                                "Dataset rejected by quality gate."
-                            )
-                            for issue in q2["issues"]:
-                                st.error(issue)
-                else:
-                    st.error(
-                        "Dataset rejected by quality gate."
+            if upload:
+                try:
+                    uploaded_df = read_partnerops_upload(upload)
+                    normalized = normalize_dataframe(uploaded_df)
+                    q = quality_check(
+                        normalized,
+                        industry,
                     )
 
-                    for issue in q["issues"]:
-                        st.error(issue)
+                    st.caption(
+                        f"Detected: {upload.name} · "
+                        f"{len(uploaded_df):,} source row(s) · "
+                        f"{len(normalized.columns):,} normalized column(s)"
+                    )
 
-            except Exception as exc:
-                st.error(
-                    f"Upload failed: {exc}"
-                )
+                    st.dataframe(
+                        normalized.head(20),
+                        use_container_width=True,
+                    )
 
-    st.stop()
+                    if q["status"] != "BLOCKED":
+                        if st.button(
+                            "Accept Dataset",
+                            key="blocked_upload_accept",
+                        ):
+                            ok, q2 = set_current_data(
+                                uploaded_df,
+                                industry,
+                                upload.name,
+                            )
 
+                            if ok:
+                                st.success(
+                                    "Dataset accepted and saved."
+                                )
+                                st.rerun()
+                            else:
+                                st.error(
+                                    "Dataset rejected by quality gate."
+                                )
+                                for issue in q2["issues"]:
+                                    st.error(issue)
+                    else:
+                        st.error(
+                            "Dataset rejected by quality gate."
+                        )
 
-if sufficiency["status"] == "RED":
-    st.error(
-        f"Data-sufficiency gate is blocking diagnostic intelligence: "
-        f"{sufficiency['readiness']}% readiness."
+                        for issue in q["issues"]:
+                            st.error(issue)
+
+                except Exception as exc:
+                    st.error(
+                        f"Upload failed: {exc}"
+                    )
+
+        st.stop()
+
+    performance_df = performance_engine(
+        raw_df,
+        industry,
     )
-    st.warning(sufficiency["headline"])
 
-    if sufficiency["missing"]:
-        st.subheader("Evidence still required")
-        for item in sufficiency["missing"]:
-            st.write(f"• {item}")
-
-    st.info(
-        "Open Data Quality to review the full evidence assessment and upload "
-        "a stronger operational dataset. No diagnostic conclusions are generated from this dataset."
+    predictive_df = predictive_risk(
+        performance_df,
+        industry,
     )
-    st.stop()
 
-performance_df = performance_engine(
-    raw_df,
-    industry,
-)
+    anomalies_df = anomaly_analysis(
+        performance_df,
+        industry,
+    )
 
-performance_df = apply_sufficiency_guard(
-    performance_df,
-    sufficiency,
-)
-
-predictive_df = predictive_risk(
-    performance_df,
-    industry,
-)
-
-anomalies_df = anomaly_analysis(
-    performance_df,
-    industry,
-)
-
-save_snapshot(
-    performance_df,
-    industry,
-    st.session_state.tenant_id,
-)
+    save_snapshot(
+        performance_df,
+        industry,
+        st.session_state.tenant_id,
+    )
 
 
 # ============================================================
 # 28. COMMAND CENTER
 # ============================================================
+
+if page == "Contract Management":
+
+    if not module_enabled(st.session_state.get("tenant_id"), "contract_intelligence"):
+        st.error("Contract Intelligence is not enabled for this customer.")
+        st.stop()
+
+    st.title("📑 Contract Management & Contract Intelligence")
+    st.caption("Contract → Obligation → SLA → Performance → Risk → Action → Outcome → Value")
+
+    customer_view = st.session_state.get("access_mode") == "customer"
+    contracts_df = contract_summary_df()
+
+    # Executive contract control strip
+    active_count = int((contracts_df["status"] == "Active").sum()) if not contracts_df.empty else 0
+    expiring_count = int(contracts_df["status"].isin(["Expiring", "Renewal Pending"]).sum()) if not contracts_df.empty else 0
+    breached_count = 0
+    value_at_risk = 0.0
+    if not contracts_df.empty:
+        for cid in contracts_df["contract_id"].tolist():
+            obs = db_execute("SELECT COUNT(*) AS n FROM contract_obligations WHERE tenant_id = ? AND contract_id = ? AND status = 'Breached'", (st.session_state.tenant_id, int(cid)), fetch=True)
+            breached_count += int(obs[0]["n"] or 0)
+            value_at_risk += _contract_value_at_risk(int(cid))
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Contracts", len(contracts_df))
+    c2.metric("Active", active_count)
+    c3.metric("Renewal / Expiry Watch", expiring_count)
+    c4.metric("Value at Risk", f"KES {value_at_risk:,.0f}")
+
+    if not contracts_df.empty:
+        st.subheader("Contract Portfolio")
+        view_cols = [c for c in ["contract_number", "title", "counterparty", "partner_name", "industry", "status", "start_date", "end_date", "days_remaining", "risk_level", "currency", "contract_value", "performance_score"] if c in contracts_df.columns]
+        st.dataframe(contracts_df[view_cols], use_container_width=True, hide_index=True)
+
+    if not customer_view and _require_contract_write():
+        st.divider()
+        st.subheader("Create Contract")
+        with st.form("create_contract_form", clear_on_submit=True):
+            a, b = st.columns(2)
+            with a:
+                contract_number = st.text_input("Contract number *")
+                contract_title = st.text_input("Contract title *")
+                counterparty = st.text_input("Counterparty / legal entity *")
+                partner_name = st.text_input("Operational partner (optional)")
+                contract_type = st.selectbox("Contract type", ["Service Agreement", "Master Service Agreement", "Vendor", "Contractor", "Distribution", "SLA", "Lease", "Employment", "Other"])
+                contract_industry = st.selectbox("Operational industry", ["Unassigned"] + list(INDUSTRIES.keys()), index=(1 + list(INDUSTRIES.keys()).index(st.session_state.current_industry)) if st.session_state.current_industry in INDUSTRIES else 0)
+                contract_status = st.selectbox("Initial status", CONTRACT_STATUSES)
+            with b:
+                start_date = st.date_input("Start date", value=utc_now().date())
+                end_date = st.date_input("End date", value=utc_now().date() + timedelta(days=365))
+                auto_renew = st.checkbox("Auto-renewal")
+                notice_days = st.number_input("Notice period (days)", min_value=0, max_value=3650, value=30)
+                currency = st.selectbox("Currency", ["KES", "USD", "EUR", "GBP", "AED", "Other"])
+                contract_value = st.number_input("Contract value", min_value=0.0, value=0.0, step=1000.0)
+                owner = st.text_input("Contract owner")
+                risk_level = st.selectbox("Initial risk", CONTRACT_RISK_LEVELS, index=1)
+            governing_law = st.text_input("Governing law / jurisdiction", value="Kenya")
+            summary = st.text_area("Commercial / operational summary")
+            create_contract = st.form_submit_button("Create Contract", use_container_width=True)
+            if create_contract:
+                if not contract_number.strip() or not contract_title.strip() or not counterparty.strip():
+                    st.error("Contract number, title and counterparty are required.")
+                elif end_date < start_date:
+                    st.error("End date cannot be before start date.")
+                else:
+                    try:
+                        db_execute("""INSERT INTO contracts
+                        (tenant_id, contract_number, title, counterparty, partner_name, industry, contract_type, status, start_date, end_date, auto_renew, notice_days, currency, contract_value, owner, governing_law, risk_level, summary, created_by, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (st.session_state.tenant_id, contract_number.strip(), contract_title.strip(), counterparty.strip(), partner_name.strip() or None, None if contract_industry == "Unassigned" else contract_industry, contract_type, contract_status, _contract_date(start_date), _contract_date(end_date), int(auto_renew), int(notice_days), currency, float(contract_value), owner.strip() or None, governing_law.strip() or None, risk_level, summary.strip() or None, st.session_state.username, utc_iso(), utc_iso()))
+                        audit("CONTRACT_CREATED", "contract", contract_number.strip(), {"title": contract_title, "counterparty": counterparty})
+                        st.success("Contract created.")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("That contract number already exists for this customer.")
+
+    if contracts_df.empty:
+        st.info("No contracts are registered yet. Create a contract above or use the import-ready database/API layer for onboarding.")
+    else:
+        selected_options = {f"{r['contract_number']} — {r['title']}": int(r['contract_id']) for _, r in contracts_df.iterrows()}
+        selected_label = st.selectbox("Open contract", list(selected_options.keys()))
+        contract_id = selected_options[selected_label]
+        contract = contract_detail(contract_id)
+        if not contract:
+            st.error("Contract is no longer available in this tenant scope.")
+            st.stop()
+
+        score = _contract_performance_score(contract_id)
+        risk_value = _contract_value_at_risk(contract_id)
+        days_remaining = _contract_days_remaining(contract.get("end_date"))
+        if days_remaining is not None and days_remaining <= int(contract.get("notice_days") or 0) and contract.get("status") not in ["Expired", "Terminated"]:
+            derived_status = "Renewal Pending"
+        else:
+            derived_status = _contract_status_from_dates(contract.get("start_date"), contract.get("end_date"), contract.get("status"))
+
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Contract Health", f"{score:.1f}%" if score is not None else "Not measured")
+        h2.metric("Days Remaining", days_remaining if days_remaining is not None else "—")
+        h3.metric("Value at Risk", f"{contract.get('currency','KES')} {risk_value:,.0f}")
+        h4.metric("Lifecycle", derived_status)
+
+        tabs = st.tabs(["Overview", "Obligations", "SLAs", "Events & Renewals", "Documents", "Compliance", "Actions"])
+
+        with tabs[0]:
+            st.subheader(f"{contract['contract_number']} — {contract['title']}")
+            overview = pd.DataFrame([
+                {"Field": "Counterparty", "Value": contract.get("counterparty")},
+                {"Field": "Operational Partner", "Value": contract.get("partner_name") or "—"},
+                {"Field": "Type", "Value": contract.get("contract_type")},
+                {"Field": "Status", "Value": derived_status},
+                {"Field": "Term", "Value": f"{contract.get('start_date') or '—'} → {contract.get('end_date') or '—'}"},
+                {"Field": "Auto Renewal", "Value": "Yes" if contract.get("auto_renew") else "No"},
+                {"Field": "Notice Period", "Value": f"{contract.get('notice_days') or 0} days"},
+                {"Field": "Owner", "Value": contract.get("owner") or "—"},
+                {"Field": "Governing Law", "Value": contract.get("governing_law") or "—"},
+                {"Field": "Contract Value", "Value": f"{contract.get('currency','KES')} {float(contract.get('contract_value') or 0):,.2f}"},
+                {"Field": "Risk", "Value": contract.get("risk_level")},
+            ])
+            st.dataframe(overview, use_container_width=True, hide_index=True)
+            if contract.get("summary"):
+                st.markdown("**Summary**")
+                st.write(contract["summary"])
+            if not customer_view and _require_contract_write():
+                if st.button("Recalculate Lifecycle Status", key=f"refresh_contract_{contract_id}"):
+                    db_execute("UPDATE contracts SET status = ?, updated_at = ? WHERE tenant_id = ? AND contract_id = ?", (derived_status, utc_iso(), st.session_state.tenant_id, contract_id))
+                    audit("CONTRACT_STATUS_RECALCULATED", "contract", contract_id, {"status": derived_status})
+                    st.rerun()
+
+        with tabs[1]:
+            st.subheader("Obligation Register")
+            obligations = db_execute("SELECT * FROM contract_obligations WHERE tenant_id = ? AND contract_id = ? ORDER BY due_date IS NULL, due_date, obligation_id", (st.session_state.tenant_id, contract_id), fetch=True)
+            odf = pd.DataFrame([dict(r) for r in obligations])
+            if not odf.empty:
+                st.dataframe(odf, use_container_width=True, hide_index=True)
+            else:
+                st.info("No obligations recorded yet.")
+            if not customer_view and _require_contract_write():
+                with st.form(f"obligation_form_{contract_id}", clear_on_submit=True):
+                    a,b = st.columns(2)
+                    with a:
+                        ot = st.text_input("Obligation title *")
+                        desc = st.text_area("Description")
+                        party = st.selectbox("Responsible party", ["Our organization", "Counterparty", "Operational partner", "Shared / joint"])
+                        owner_o = st.text_input("Action owner")
+                        due = st.date_input("Due date", value=utc_now().date())
+                        recurrence = st.selectbox("Recurrence", ["One-off", "Daily", "Weekly", "Monthly", "Quarterly", "Annual"])
+                    with b:
+                        target = st.number_input("Target value", value=0.0)
+                        unit = st.text_input("Unit", value="%")
+                        evidence = st.text_input("Evidence required")
+                        ostatus = st.selectbox("Status", OBLIGATION_STATUSES)
+                        orisk = st.selectbox("Risk", CONTRACT_RISK_LEVELS, index=1)
+                        var = st.number_input("Value at risk", min_value=0.0, value=0.0, step=1000.0)
+                        next_due = st.date_input("Next due date", value=due)
+                    notes = st.text_area("Notes")
+                    add_obligation = st.form_submit_button("Add Obligation", use_container_width=True)
+                    if add_obligation:
+                        if not ot.strip():
+                            st.error("Obligation title is required.")
+                        else:
+                            db_execute("""INSERT INTO contract_obligations
+                            (tenant_id, contract_id, obligation_title, description, responsible_party, owner, due_date, recurrence, target_value, unit, evidence_required, status, risk_level, value_at_risk, next_due_date, notes, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (st.session_state.tenant_id, contract_id, ot.strip(), desc.strip() or None, party, owner_o.strip() or None, _contract_date(due), recurrence, float(target), unit.strip() or None, evidence.strip() or None, ostatus, orisk, float(var), _contract_date(next_due), notes.strip() or None, utc_iso()))
+                            audit("CONTRACT_OBLIGATION_CREATED", "contract_obligation", contract_id, {"title": ot, "status": ostatus, "value_at_risk": var})
+                            st.success("Obligation added.")
+                            st.rerun()
+
+        with tabs[2]:
+            st.subheader("SLA Register & Operational Measurement")
+            slas = db_execute("SELECT * FROM contract_slas WHERE tenant_id = ? AND contract_id = ? ORDER BY sla_id", (st.session_state.tenant_id, contract_id), fetch=True)
+            sdf = pd.DataFrame([dict(r) for r in slas])
+            if not sdf.empty:
+                st.dataframe(sdf, use_container_width=True, hide_index=True)
+            else:
+                st.info("No SLAs mapped to this contract yet.")
+            if not customer_view and _require_contract_write():
+                with st.form(f"sla_form_{contract_id}", clear_on_submit=True):
+                    a,b = st.columns(2)
+                    with a:
+                        sn = st.text_input("SLA name *")
+                        metric = st.text_input("PartnerOps metric / dataset column *", placeholder="completion_rate")
+                        target = st.number_input("Target", value=90.0)
+                        direction = st.selectbox("Performance direction", SLA_DIRECTIONS)
+                        unit = st.text_input("Unit", value="%")
+                    with b:
+                        period = st.selectbox("Measurement period", ["Daily", "Weekly", "Monthly", "Quarterly"])
+                        grace = st.number_input("Grace period (days)", min_value=0, max_value=365, value=0)
+                        penalty = st.number_input("Penalty rate", min_value=0.0, value=0.0, help="Store as a rate/percentage defined by the contract; calculation is informational until configured.")
+                        notes = st.text_area("SLA notes")
+                    add_sla = st.form_submit_button("Add SLA", use_container_width=True)
+                    if add_sla:
+                        if not sn.strip() or not metric.strip():
+                            st.error("SLA name and metric are required.")
+                        else:
+                            db_execute("""INSERT INTO contract_slas
+                            (tenant_id, contract_id, sla_name, metric_name, target_value, direction, unit, measurement_period, grace_period_days, penalty_rate, notes, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (st.session_state.tenant_id, contract_id, sn.strip(), metric.strip().lower(), float(target), direction, unit.strip() or "%", period, int(grace), float(penalty), notes.strip() or None, utc_iso()))
+                            audit("CONTRACT_SLA_CREATED", "contract_sla", contract_id, {"name": sn, "metric": metric, "target": target})
+                            st.success("SLA added.")
+                            st.rerun()
+            if not sdf.empty:
+                st.caption("SLA measurement uses the currently loaded PartnerOps dataset. It is a controlled operational signal, not a claim of legal compliance.")
+                for _, row in sdf.iterrows():
+                    if st.button(f"Measure {row['sla_name']}", key=f"measure_sla_{int(row['sla_id'])}", use_container_width=True):
+                        result = _refresh_contract_sla(int(row["sla_id"]))
+                        audit("CONTRACT_SLA_MEASURED", "contract_sla", int(row["sla_id"]), result or {})
+                        if result and result.get("status") == "Breached":
+                            st.warning(f"SLA breach signal detected: {result.get('value'):.2f} vs target {row['target_value']:.2f}.")
+                        elif result and result.get("value") is not None:
+                            st.success(f"Measured {result.get('value'):.2f}; target {row['target_value']:.2f}.")
+                        else:
+                            st.info("The current dataset cannot measure this SLA yet.")
+                        st.rerun()
+
+        with tabs[3]:
+            st.subheader("Events, Notices, Amendments & Renewals")
+            events = db_execute("SELECT * FROM contract_events WHERE tenant_id = ? AND contract_id = ? ORDER BY event_date DESC, event_id DESC", (st.session_state.tenant_id, contract_id), fetch=True)
+            edf = pd.DataFrame([dict(r) for r in events])
+            if not edf.empty:
+                st.dataframe(edf, use_container_width=True, hide_index=True)
+            else:
+                st.info("No contract events recorded.")
+            if not customer_view and _require_contract_write():
+                with st.form(f"event_form_{contract_id}", clear_on_submit=True):
+                    a,b = st.columns(2)
+                    with a:
+                        etype = st.selectbox("Event type", ["Renewal", "Notice", "Amendment", "Review", "Breach", "Meeting", "Milestone", "Other"])
+                        edate = st.date_input("Event date", value=utc_now().date())
+                        etitle = st.text_input("Event title *")
+                    with b:
+                        eowner = st.text_input("Owner")
+                        estatus = st.selectbox("Event status", ["Open", "In Progress", "Completed", "Cancelled"])
+                    edesc = st.text_area("Description")
+                    add_event = st.form_submit_button("Record Event", use_container_width=True)
+                    if add_event:
+                        if not etitle.strip():
+                            st.error("Event title is required.")
+                        else:
+                            db_execute("""INSERT INTO contract_events
+                            (tenant_id, contract_id, event_type, event_date, title, description, owner, status, created_by, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (st.session_state.tenant_id, contract_id, etype, _contract_date(edate), etitle.strip(), edesc.strip() or None, eowner.strip() or None, estatus, st.session_state.username, utc_iso()))
+                            audit("CONTRACT_EVENT_CREATED", "contract_event", contract_id, {"type": etype, "title": etitle})
+                            st.success("Contract event recorded.")
+                            st.rerun()
+
+        with tabs[4]:
+            st.subheader("Contract Document Register")
+            docs = db_execute("SELECT document_id, filename, mime_type, file_size, sha256, uploaded_by, uploaded_at FROM contract_documents WHERE tenant_id = ? AND contract_id = ? ORDER BY document_id DESC", (st.session_state.tenant_id, contract_id), fetch=True)
+            ddf = pd.DataFrame([dict(r) for r in docs])
+            if not ddf.empty:
+                st.dataframe(ddf, use_container_width=True, hide_index=True)
+            else:
+                st.info("No contract documents stored.")
+            if not customer_view and _require_contract_write():
+                doc = st.file_uploader("Upload contract document (pilot vault)", type=["pdf", "docx", "txt", "png", "jpg", "jpeg"], key=f"contract_doc_{contract_id}")
+                st.caption("Pilot storage uses tenant-scoped SQLite BLOB storage. For production, move document content to encrypted object storage and retain the SHA-256 integrity record here.")
+                if doc and st.button("Store Contract Document", key=f"store_doc_{contract_id}", use_container_width=True):
+                    raw = doc.getvalue()
+                    if len(raw) > CONTRACT_DOCUMENT_MAX_BYTES:
+                        st.error("Contract document exceeds the 10 MB pilot document limit.")
+                    else:
+                        digest = hashlib.sha256(raw).hexdigest()
+                        try:
+                            stored_content = _encrypt_contract_document(raw)
+                        except RuntimeError as exc:
+                            st.error(str(exc))
+                            stored_content = None
+                        if stored_content is not None:
+                            db_execute("""INSERT INTO contract_documents
+                            (tenant_id, contract_id, filename, mime_type, file_size, sha256, content, uploaded_by, uploaded_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (st.session_state.tenant_id, contract_id, doc.name[:255], doc.type, len(raw), digest, sqlite3.Binary(stored_content), st.session_state.username, utc_iso()))
+                            audit("CONTRACT_DOCUMENT_UPLOADED", "contract_document", contract_id, {"filename": doc.name, "sha256": digest, "size": len(raw)})
+                            st.success("Document stored with integrity hash.")
+                            st.rerun()
+            if not ddf.empty:
+                chosen_doc = st.selectbox("Document to download", [f"{int(r['document_id'])} — {r['filename']}" for _, r in ddf.iterrows()], key=f"download_doc_{contract_id}")
+                doc_id = int(chosen_doc.split(" — ", 1)[0])
+                row = db_execute("SELECT filename, mime_type, content, sha256 FROM contract_documents WHERE tenant_id = ? AND contract_id = ? AND document_id = ?", (st.session_state.tenant_id, contract_id, doc_id), fetch=True)
+                if row and row[0]["content"] is not None:
+                    try:
+                        download_bytes = _decrypt_contract_document(row[0]["content"])
+                    except RuntimeError as exc:
+                        st.error(str(exc))
+                        download_bytes = None
+                    if download_bytes is not None:
+                        if hashlib.sha256(download_bytes).hexdigest() != row[0]["sha256"]:
+                            st.error("Document integrity check failed. Download has been blocked.")
+                        else:
+                            st.download_button("Download selected document", data=download_bytes, file_name=row[0]["filename"], mime=row[0]["mime_type"] or "application/octet-stream", use_container_width=True)
+
+        with tabs[5]:
+            st.subheader("Compliance & Contract Reviews")
+            reviews = db_execute("SELECT * FROM contract_reviews WHERE tenant_id = ? AND contract_id = ? ORDER BY review_date DESC, review_id DESC", (st.session_state.tenant_id, contract_id), fetch=True)
+            rdf = pd.DataFrame([dict(r) for r in reviews])
+            if not rdf.empty:
+                st.dataframe(rdf, use_container_width=True, hide_index=True)
+            else:
+                st.info("No compliance reviews recorded.")
+            if not customer_view and _require_contract_write():
+                with st.form(f"review_form_{contract_id}", clear_on_submit=True):
+                    a,b = st.columns(2)
+                    with a:
+                        rtype = st.selectbox("Review type", ["Quarterly", "Annual", "Pre-Renewal", "SLA", "Compliance", "Incident", "Other"])
+                        rdate = st.date_input("Review date", value=utc_now().date())
+                        reviewer = st.text_input("Reviewer *")
+                    with b:
+                        result = st.selectbox("Result", ["Compliant", "Partially Compliant", "Non-Compliant", "Pending Evidence"])
+                        rstatus = st.selectbox("Review status", ["Open", "In Progress", "Closed"])
+                    findings = st.text_area("Findings")
+                    remediation = st.text_area("Remediation / required action")
+                    add_review = st.form_submit_button("Record Review", use_container_width=True)
+                    if add_review:
+                        if not reviewer.strip():
+                            st.error("Reviewer is required.")
+                        else:
+                            db_execute("""INSERT INTO contract_reviews
+                            (tenant_id, contract_id, review_type, review_date, reviewer, result, findings, remediation, status, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            (st.session_state.tenant_id, contract_id, rtype, _contract_date(rdate), reviewer.strip(), result, findings.strip() or None, remediation.strip() or None, rstatus, utc_iso()))
+                            audit("CONTRACT_REVIEW_CREATED", "contract_review", contract_id, {"type": rtype, "result": result})
+                            st.success("Review recorded.")
+                            st.rerun()
+
+        with tabs[6]:
+            st.subheader("Contract Recovery Actions")
+            at_risk = db_execute("SELECT * FROM contract_obligations WHERE tenant_id = ? AND contract_id = ? AND status IN ('At Risk','Breached') ORDER BY value_at_risk DESC", (st.session_state.tenant_id, contract_id), fetch=True)
+            if at_risk:
+                risk_df = pd.DataFrame([dict(r) for r in at_risk])
+                st.dataframe(risk_df, use_container_width=True, hide_index=True)
+                if not customer_view and _require_contract_write():
+                    for row in at_risk:
+                        if st.button(f"Create PartnerOps action: {row['obligation_title']}", key=f"contract_action_{row['obligation_id']}", use_container_width=True):
+                            priority = "Critical" if row["status"] == "Breached" or row["risk_level"] == "Critical" else "High"
+                            _create_contract_action(contract_id, f"Resolve contract obligation: {row['obligation_title']}", row["owner"] or contract.get("owner") or st.session_state.username, priority, row["next_due_date"] or row["due_date"], float(row["value_at_risk"] or 0), obligation_id=int(row["obligation_id"]))
+                            st.success("Recovery action created in PartnerOps Action Management.")
+            else:
+                st.success("No contract obligations are currently marked At Risk or Breached.")
 
 if page == "Command Center":
 
@@ -4909,77 +5256,6 @@ elif page == "Data Quality":
         industry,
     )
 
-    sufficiency_status = data_sufficiency_check(
-        raw_df,
-        industry,
-    )
-
-    st.subheader("Diagnostic Readiness")
-    readiness_cols = st.columns(4)
-    readiness_cols[0].metric(
-        "Readiness",
-        f"{sufficiency_status['readiness']}%",
-    )
-    readiness_cols[1].metric(
-        "Gate",
-        sufficiency_status["status"],
-    )
-    readiness_cols[2].metric(
-        "Rows",
-        sufficiency_status["rows"],
-    )
-    readiness_cols[3].metric(
-        "Periods",
-        sufficiency_status["periods"],
-    )
-
-    if sufficiency_status["status"] == "GREEN":
-        st.success(
-            f"Diagnostic Readiness: {sufficiency_status['readiness']}% — GREEN. "
-            f"{sufficiency_status['headline']}"
-        )
-    elif sufficiency_status["status"] == "AMBER":
-        st.warning(
-            f"Diagnostic Readiness: {sufficiency_status['readiness']}% — AMBER. "
-            f"{sufficiency_status['headline']}"
-        )
-    else:
-        st.error(
-            f"Diagnostic Readiness: {sufficiency_status['readiness']}% — RED. "
-            f"{sufficiency_status['headline']}"
-        )
-
-    st.caption(sufficiency_status["detail"])
-
-    evidence_df = pd.DataFrame(
-        [
-            {
-                "Evidence": item["evidence"],
-                "Points": f"{item['points']}/{item['max_points']}",
-                "Detected": "Yes" if item["available"] else "No",
-                "Assessment": item["detail"],
-            }
-            for item in sufficiency_status["items"]
-        ]
-    )
-    st.dataframe(
-        evidence_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    if sufficiency_status["missing"]:
-        st.subheader("Evidence gaps")
-        for item in sufficiency_status["missing"]:
-            st.write(f"• {item}")
-
-    if sufficiency_status["limitations"]:
-        st.subheader("Diagnostic limitations")
-        for item in sufficiency_status["limitations"]:
-            st.warning(item)
-
-    st.divider()
-
     if status["status"] == "GOOD":
         st.success(
             "Dataset passed the data-quality gate."
@@ -5052,10 +5328,6 @@ elif page == "Data Quality":
                     normalized,
                     industry,
                 )
-                sq = data_sufficiency_check(
-                    normalized,
-                    industry,
-                )
 
                 summary = ingestion_summary(
                     uploaded_df,
@@ -5064,10 +5336,8 @@ elif page == "Data Quality":
                 )
 
                 st.write(
-                    f"Quality status: **{q['status']}** · "
-                    f"Diagnostic readiness: **{sq['readiness']}% — {sq['status']}**"
+                    f"Quality status: **{q['status']}**"
                 )
-                st.caption(sq["headline"])
                 st.caption(
                     f"{summary['filename']} · "
                     f"{summary['source_rows']:,} source row(s) · "
@@ -5371,6 +5641,7 @@ elif page == "Administration":
     tabs = st.tabs(
         [
             "Customers",
+            "Modules",
             "Entitlements",
             "Access Links",
             "Users",
@@ -5471,6 +5742,11 @@ elif page == "Administration":
                             utc_iso(),
                         ),
                     )
+                    for module_key in ("partner_performance", "contract_intelligence"):
+                        db_execute(
+                            "INSERT OR IGNORE INTO tenant_modules(tenant_id, module_key, enabled) VALUES (?, ?, 1)",
+                            (tenant_id, module_key),
+                        )
 
                     audit(
                         "TENANT_CREATED",
@@ -5489,10 +5765,31 @@ elif page == "Administration":
                     st.rerun()
 
     # --------------------------------------------------------
-    # ENTITLEMENTS
+    # MODULE ENTITLEMENTS
     # --------------------------------------------------------
 
     with tabs[1]:
+        st.subheader("Customer Module Entitlements")
+        st.caption("Partner Performance and Contract Intelligence can be sold and operated independently for each tenant.")
+        module_tenants = db_execute("SELECT tenant_id, tenant_name FROM tenants ORDER BY tenant_name", fetch=True)
+        module_choices = {row["tenant_name"]: row["tenant_id"] for row in module_tenants}
+        if module_choices:
+            module_customer_name = st.selectbox("Customer", list(module_choices.keys()), key="module_customer")
+            module_customer_id = module_choices[module_customer_name]
+            for module_key, module_label in (("partner_performance", "Partner Performance Intelligence"), ("contract_intelligence", "Contract Intelligence / CMS")):
+                enabled = module_enabled(module_customer_id, module_key)
+                new_value = st.checkbox(module_label, value=enabled, key=f"module_{module_customer_id}_{module_key}")
+                if new_value != enabled:
+                    db_execute("""INSERT INTO tenant_modules(tenant_id, module_key, enabled) VALUES (?, ?, ?)
+                                   ON CONFLICT(tenant_id, module_key) DO UPDATE SET enabled = excluded.enabled""", (module_customer_id, module_key, int(new_value)))
+                    audit("MODULE_ENTITLEMENT_CHANGED", "tenant", module_customer_id, {"module": module_key, "enabled": new_value})
+                    st.rerun()
+
+    # --------------------------------------------------------
+    # INDUSTRY ENTITLEMENTS
+    # --------------------------------------------------------
+
+    with tabs[2]:
 
         st.subheader(
             "Industry Entitlements"
@@ -5574,7 +5871,7 @@ elif page == "Administration":
     # ACCESS LINKS
     # --------------------------------------------------------
 
-    with tabs[2]:
+    with tabs[3]:
 
         st.subheader(
             "Customer Access Links"
@@ -5702,51 +5999,19 @@ elif page == "Administration":
             fetch=True,
         )
 
-        active_links_df = pd.DataFrame(
-            [dict(r) for r in rows]
-        )
         st.dataframe(
-            active_links_df,
+            pd.DataFrame(
+                [dict(r) for r in rows]
+            ),
             use_container_width=True,
             hide_index=True,
         )
-
-        st.subheader("Revoke a single access link")
-        link_ids = [int(row["link_id"]) for row in rows if row["active"]]
-        if link_ids:
-            revoke_id = st.selectbox(
-                "Active link",
-                link_ids,
-                key="revoke_access_link_id",
-            )
-            if st.button(
-                "Revoke Selected Link",
-                use_container_width=True,
-            ):
-                db_execute(
-                    """
-                    UPDATE access_links
-                    SET active = 0, revoked_at = ?
-                    WHERE link_id = ? AND active = 1
-                    """,
-                    (utc_iso(), revoke_id),
-                )
-                audit(
-                    "ACCESS_LINK_REVOKED",
-                    "access_link",
-                    revoke_id,
-                    {"reason": "manual_revoke"},
-                )
-                st.success("Selected access link revoked.")
-                st.rerun()
-        else:
-            st.info("No active access links to revoke.")
 
     # --------------------------------------------------------
     # USERS
     # --------------------------------------------------------
 
-    with tabs[3]:
+    with tabs[4]:
 
         st.subheader(
             "Customer Users"
@@ -5900,7 +6165,7 @@ elif page == "Administration":
     # SNAPSHOTS
     # --------------------------------------------------------
 
-    with tabs[4]:
+    with tabs[5]:
 
         st.subheader(
             "Performance History / Snapshots"
@@ -5939,7 +6204,7 @@ elif page == "Administration":
     # AUDIT LOG
     # --------------------------------------------------------
 
-    with tabs[5]:
+    with tabs[6]:
 
         st.subheader(
             "Security / Audit Log"
@@ -5978,7 +6243,7 @@ elif page == "Administration":
     # INTEGRATIONS
     # --------------------------------------------------------
 
-    with tabs[6]:
+    with tabs[7]:
 
         st.subheader(
             "Integration Architecture"
@@ -6045,7 +6310,7 @@ elif page == "Administration":
     # SYSTEM
     # --------------------------------------------------------
 
-    with tabs[7]:
+    with tabs[8]:
 
         st.subheader(
             "Platform Configuration"
