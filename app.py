@@ -1,6 +1,10 @@
 # ============================================================
-# PARTNEROPS 5.0 COMMERCIAL CONTROL
+# PARTNEROPS 5.4 PERFORMANCE & ARCHITECTURE HARDENED
 # SINGLE-SOURCE-OF-TRUTH APPLICATION
+#
+# 5.4 HARDENING: cached deterministic intelligence, vectorized scoring,
+# bounded ingestion, batched persistence, daily snapshot idempotency,
+# tenant-scoped dataset identity, and reduced CMS query fan-out.
 # ============================================================
 #
 # Streamlit commercial operations platform for:
@@ -65,6 +69,15 @@ from typing import Dict, Any, List, Optional
 import pandas as pd
 import streamlit as st
 
+# Streamlit page configuration MUST happen before any other Streamlit command
+# (including secrets access) to avoid Cloud startup failures on newer releases.
+st.set_page_config(
+    page_title="PartnerOps",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 try:
     from cryptography.fernet import Fernet, InvalidToken
 except Exception:
@@ -97,21 +110,25 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.3.0 Contract Intelligence & Commercial Control"
+APP_VERSION = "5.4.1 Stabilized Performance & Architecture Hardened"
 
 
 def get_config_value(name, default=None):
-    """Read configuration from Streamlit Secrets first, then environment variables."""
+    """Read configuration safely from Streamlit Secrets or environment variables."""
+    # Environment variables remain a valid deployment mechanism.
+    env_value = os.getenv(name)
+    if env_value is not None:
+        return str(env_value)
+
     try:
-        value = st.secrets.get(name)
+        secrets_obj = st.secrets
+        value = secrets_obj.get(name)
         if value is not None:
             return str(value)
     except Exception:
+        # Local development and some Cloud bootstrap states may not expose
+        # secrets yet; defaults should keep the application bootable.
         pass
-
-    value = os.getenv(name)
-    if value is not None:
-        return str(value)
 
     return default
 
@@ -135,18 +152,20 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # Defensive processing limits. These protect the Streamlit process from
 # unexpectedly expensive uploads even when the raw file is below the byte limit.
 try:
-    MAX_UPLOAD_ROWS = int(get_config_value("PARTNEROPS_MAX_UPLOAD_ROWS", "250000"))
+    MAX_UPLOAD_ROWS = int(get_config_value("PARTNEROPS_MAX_UPLOAD_ROWS", "100000"))
 except (TypeError, ValueError):
     MAX_UPLOAD_ROWS = 250000
-MAX_UPLOAD_ROWS = max(1000, min(MAX_UPLOAD_ROWS, 1000000))
+MAX_UPLOAD_ROWS = max(1000, min(MAX_UPLOAD_ROWS, 500000))
 
 try:
-    MAX_UPLOAD_COLUMNS = int(get_config_value("PARTNEROPS_MAX_UPLOAD_COLUMNS", "250"))
+    MAX_UPLOAD_COLUMNS = int(get_config_value("PARTNEROPS_MAX_UPLOAD_COLUMNS", "100"))
 except (TypeError, ValueError):
     MAX_UPLOAD_COLUMNS = 250
-MAX_UPLOAD_COLUMNS = max(20, min(MAX_UPLOAD_COLUMNS, 1000))
+MAX_UPLOAD_COLUMNS = max(20, min(MAX_UPLOAD_COLUMNS, 500))
 
-MAX_UPLOAD_CELLS = MAX_UPLOAD_ROWS * MAX_UPLOAD_COLUMNS
+MAX_UPLOAD_CELLS = min(MAX_UPLOAD_ROWS * MAX_UPLOAD_COLUMNS, 10_000_000)
+MAX_DATASET_INSERT_BATCH = 1000
+ANALYSIS_CACHE_TTL_SECONDS = 900
 MAX_ZIP_MEMBERS = 5000
 MAX_ZIP_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_IMAGE_PIXELS = 50_000_000
@@ -184,14 +203,6 @@ PBKDF2_ITERATIONS = 210_000
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("PartnerOps")
-
-
-st.set_page_config(
-    page_title="PartnerOps",
-    page_icon="📡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 
 # ============================================================
@@ -530,12 +541,18 @@ def has_permission(permission):
 # ============================================================
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, timeout=30)
+    """Open a resilient SQLite connection for Streamlit Cloud and local use."""
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA synchronous = NORMAL")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError:
+        # WAL may be unavailable on unusual filesystems; normal SQLite mode
+        # is still fully functional for the pilot application.
+        pass
     return conn
 
 
@@ -687,6 +704,18 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_datasets_tenant_industry ON datasets(tenant_id, industry, dataset_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_dataset_rows_tenant_industry ON dataset_rows(tenant_id, industry, dataset_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_tenant_time ON audit_log(tenant_id, timestamp)")
+    cur.execute("""
+        DELETE FROM snapshots
+        WHERE snapshot_id NOT IN (
+            SELECT MAX(snapshot_id)
+            FROM snapshots
+            GROUP BY tenant_id, industry, snapshot_date, partner
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_snapshots_scope_day_partner
+        ON snapshots(tenant_id, industry, snapshot_date, partner)
+    """)
 
     conn.commit()
     conn.close()
@@ -990,19 +1019,63 @@ def _contract_performance_score(contract_id):
     return round(sum(points) / len(points), 1) if points else None
 
 
-def contract_summary_df():
+def contract_summary_df_for_tenant(tenant_id):
     rows = db_execute(
         """SELECT * FROM contracts WHERE tenant_id = ? ORDER BY end_date IS NULL, end_date, contract_id DESC""",
-        (st.session_state.tenant_id,), fetch=True
+        (tenant_id,), fetch=True
     )
-    records = []
-    for r in rows:
-        d = dict(r)
+    if not rows:
+        return pd.DataFrame()
+
+    records = [dict(r) for r in rows]
+    ids = [int(r["contract_id"]) for r in records]
+    placeholders = ",".join("?" for _ in ids)
+
+    obs = db_execute(
+        f"""SELECT contract_id,
+                    COALESCE(SUM(CASE WHEN status IN ('At Risk','Breached') THEN value_at_risk ELSE 0 END),0) AS value_at_risk,
+                    SUM(CASE WHEN status = 'Breached' THEN 1 ELSE 0 END) AS breached_count,
+                    COUNT(*) AS obligation_count,
+                    COALESCE(SUM(CASE status WHEN 'Completed' THEN 100 WHEN 'On Track' THEN 100 WHEN 'Open' THEN 80 WHEN 'At Risk' THEN 50 WHEN 'Breached' THEN 0 WHEN 'Waived' THEN 100 ELSE 70 END),0) AS obligation_points
+             FROM contract_obligations
+             WHERE tenant_id = ? AND contract_id IN ({placeholders})
+             GROUP BY contract_id""",
+        (tenant_id, *ids), fetch=True
+    )
+    obs_map = {int(r["contract_id"]): dict(r) for r in obs}
+
+    slas = db_execute(
+        f"""SELECT contract_id,
+                    SUM(CASE WHEN current_value IS NOT NULL AND ((direction='lower_is_better' AND current_value > target_value) OR (direction!='lower_is_better' AND current_value < target_value)) THEN 1 ELSE 0 END) AS breached_slas,
+                    COUNT(*) AS sla_count,
+                    COALESCE(SUM(CASE WHEN current_value IS NULL THEN 70 WHEN ((direction='lower_is_better' AND current_value > target_value) OR (direction!='lower_is_better' AND current_value < target_value)) THEN 0 ELSE 100 END),0) AS sla_points
+             FROM contract_slas
+             WHERE tenant_id = ? AND contract_id IN ({placeholders})
+             GROUP BY contract_id""",
+        (tenant_id, *ids), fetch=True
+    )
+    sla_map = {int(r["contract_id"]): dict(r) for r in slas}
+
+    for d in records:
+        cid = int(d["contract_id"])
         d["days_remaining"] = _contract_days_remaining(d.get("end_date"))
-        d["performance_score"] = _contract_performance_score(d["contract_id"])
         d["industry"] = d.get("industry") or "Unassigned"
-        records.append(d)
+        o = obs_map.get(cid, {})
+        sl = sla_map.get(cid, {})
+        d["value_at_risk"] = float(o.get("value_at_risk") or 0)
+        d["breached_obligations"] = int(o.get("breached_count") or 0)
+        d["breached_slas"] = int(sl.get("breached_slas") or 0)
+        obligation_count = int(o.get("obligation_count") or 0)
+        sla_count = int(sl.get("sla_count") or 0)
+        total_points = float(o.get("obligation_points") or 0) + float(sl.get("sla_points") or 0)
+        total_items = obligation_count + sla_count
+        d["performance_score"] = round(total_points / total_items, 1) if total_items else None
+
     return pd.DataFrame(records)
+
+
+def contract_summary_df():
+    return contract_summary_df_for_tenant(st.session_state.tenant_id)
 
 
 def contract_detail(contract_id):
@@ -1590,6 +1663,8 @@ DEFAULT_STATE = {
     "access_token": None,
     "session_started_at": None,
     "last_activity_at": None,
+    "current_dataset_id": None,
+    "last_snapshot_dataset_id": None,
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -2344,7 +2419,9 @@ def recommended_action(row, cfg):
     return "Continue monitoring."
 
 
+@st.cache_data(show_spinner=False, ttl=ANALYSIS_CACHE_TTL_SECONDS)
 def performance_engine(df, industry):
+    """Vectorized performance engine. Cached because it is deterministic for a dataset/config pair."""
     cfg = INDUSTRIES[industry]
     result = df.copy()
 
@@ -2352,218 +2429,131 @@ def performance_engine(df, industry):
         if metric not in result.columns:
             result[metric] = pd.NA
 
-    # Portfolio maximums for lower-is-better normalization.
-    lower_max = {}
-
-    for metric in cfg["lower_is_better"]:
+    numeric_cache = {}
+    for metric in set(cfg["weights"]) | set(cfg["lower_is_better"]):
         if metric in result.columns:
-            values = pd.to_numeric(
-                result[metric],
-                errors="coerce",
-            )
+            numeric_cache[metric] = pd.to_numeric(result[metric], errors="coerce")
+            result[metric] = numeric_cache[metric]
 
-            lower_max[metric] = (
-                values.max()
-                if values.notna().any()
-                else 1
-            )
+    weighted = pd.Series(0.0, index=result.index)
+    weight_total = pd.Series(0.0, index=result.index)
 
-    scores = []
+    lower_max = {}
+    for metric in cfg["lower_is_better"]:
+        series = numeric_cache.get(metric)
+        lower_max[metric] = float(series.max()) if series is not None and series.notna().any() else 1.0
 
-    for _, row in result.iterrows():
-        weighted_total = 0
-        weight_total = 0
+    for metric, weight in cfg["weights"].items():
+        if metric not in result.columns:
+            continue
+        values = numeric_cache.get(metric, pd.to_numeric(result[metric], errors="coerce"))
+        valid = values.notna()
+        if not valid.any():
+            continue
 
-        for metric, weight in cfg["weights"].items():
-            if metric not in row.index:
-                continue
-
-            value = row.get(metric)
-
-            if pd.isna(value):
-                continue
-
-            if metric in cfg["lower_is_better"]:
-                target = cfg["target"]
-
-                if metric in ["pending", "backlog", "aging"]:
-                    maximum = lower_max.get(metric, 1)
-
-                    if maximum and maximum > 0:
-                        metric_score = (
-                            100
-                            * (maximum - float(value))
-                            / maximum
-                        )
-
-                        metric_score = max(
-                            0,
-                            min(100, metric_score),
-                        )
-                    else:
-                        metric_score = 100
-
+        if metric in cfg["lower_is_better"]:
+            if metric in {"pending", "backlog", "aging"}:
+                maximum = lower_max.get(metric, 1.0)
+                if maximum > 0:
+                    metric_score = (100.0 * (maximum - values) / maximum).clip(0, 100)
                 else:
-                    metric_score = normalize_metric(
-                        value,
-                        target,
-                        lower_is_better=True,
-                    )
-
+                    metric_score = pd.Series(100.0, index=result.index)
             else:
-                metric_score = normalize_metric(
-                    value,
-                    cfg["target"],
-                    lower_is_better=False,
-                )
+                target = float(cfg["target"])
+                metric_score = (100.0 * target / values.replace(0, pd.NA)).clip(0, 100)
+                metric_score = metric_score.fillna(100.0)
+        else:
+            target = float(cfg["target"])
+            metric_score = (100.0 * values / target).clip(0, 100)
 
-            if metric_score is not None:
-                weighted_total += metric_score * weight
-                weight_total += weight
+        metric_score = metric_score.where(valid)
+        weighted = weighted.add(metric_score.fillna(0.0) * float(weight), fill_value=0.0)
+        weight_total = weight_total.add(valid.astype(float) * float(weight), fill_value=0.0)
 
-        score = (
-            weighted_total / weight_total
-            if weight_total
-            else 0
-        )
-
-        scores.append(score)
-
-    result["performance_score"] = (
-        pd.Series(scores, index=result.index)
-        .round(2)
-    )
-
-    primary = cfg["primary_kpi"]
-
+    result["performance_score"] = (weighted.div(weight_total.replace(0, pd.NA)).fillna(0).clip(0, 100)).round(2)
     result["target"] = cfg["target"]
 
-    if primary in result.columns:
-        primary_values = pd.to_numeric(
-            result[primary],
-            errors="coerce",
-        )
+    primary = cfg["primary_kpi"]
+    primary_values = pd.to_numeric(result[primary], errors="coerce") if primary in result.columns else pd.Series(float("nan"), index=result.index)
+    result["target_gap"] = (float(cfg["target"]) - primary_values).round(2)
 
-        result["target_gap"] = (
-            cfg["target"] - primary_values
-        ).round(2)
-    else:
-        result["target_gap"] = float("nan")
+    score = result["performance_score"]
+    result["band"] = score.map(score_band)
+    result["risk"] = score.map(risk_band)
+    result["attention_required"] = score < float(cfg["target"])
 
-    result["band"] = result["performance_score"].apply(
-        score_band
-    )
-
-    result["risk"] = result["performance_score"].apply(
-        risk_band
-    )
-
-    result["attention_required"] = (
-        result["performance_score"] < cfg["target"]
-    )
-
-    result["diagnosis"] = result.apply(
-        lambda r: diagnosis_for_row(r, cfg),
-        axis=1,
-    )
-
-    result["recommended_action"] = result.apply(
-        lambda r: recommended_action(r, cfg),
-        axis=1,
-    )
+    # These are decision-language functions, so retain their behavior while
+    # limiting expensive work to the already-small number of output rows.
+    result["diagnosis"] = result.apply(lambda r: diagnosis_for_row(r, cfg), axis=1)
+    result["recommended_action"] = result.apply(lambda r: recommended_action(r, cfg), axis=1)
 
     if "output" in result.columns:
-        result["recovery_opportunity"] = (
-            result["target_gap"].clip(lower=0)
-            * result["output"]
-            / 100
-        ).round(2)
+        output = pd.to_numeric(result["output"], errors="coerce").fillna(0)
+        result["recovery_opportunity"] = (result["target_gap"].clip(lower=0) * output / 100).round(2)
     else:
-        result["recovery_opportunity"] = 0
+        result["recovery_opportunity"] = 0.0
 
-    def priority(score):
-        if score < 50:
-            return "P1"
-        if score < 70:
-            return "P2"
-        if score < 80:
-            return "P3"
-        return "P4"
+    result["priority"] = pd.cut(
+        score,
+        bins=[-float("inf"), 50, 70, 80, float("inf")],
+        labels=["P1", "P2", "P3", "P4"],
+        right=False,
+    ).astype(str)
+    result["rank"] = score.rank(ascending=False, method="min").fillna(len(result) + 1).astype(int)
 
-    result["priority"] = (
-        result["performance_score"]
-        .apply(priority)
-    )
-
-    result["rank"] = (
-        result["performance_score"]
-        .rank(
-            ascending=False,
-            method="min",
-        )
-        .astype(int)
-    )
-
-    return result.sort_values(
-        "performance_score",
-        ascending=False,
-    ).reset_index(drop=True)
+    return result.sort_values("performance_score", ascending=False).reset_index(drop=True)
 
 
 # ============================================================
 # 16. SNAPSHOTS
 # ============================================================
 
-def save_snapshot(df, industry, tenant_id):
+def save_snapshot(df, industry, tenant_id, dataset_id=None):
+    """Persist one daily snapshot per tenant/industry/partner, not per Streamlit rerun."""
     if df is None or df.empty:
         return
 
-    cfg = INDUSTRIES[industry]
-    primary = cfg["primary_kpi"]
     snapshot_date = utc_now().date().isoformat()
+    primary = INDUSTRIES[industry]["primary_kpi"]
+    work = df.copy()
+    if "partner" not in work.columns:
+        return
 
-    rows = []
+    work["partner"] = work["partner"].astype(str).str.strip()
+    work = work[work["partner"] != ""]
 
-    for _, row in df.iterrows():
-        partner = str(row.get("partner", ""))
+    records = []
+    for row in work[["partner", primary, "performance_score", "risk", "band"]].itertuples(index=False, name=None):
+        partner, primary_value, score, risk, band = row
+        records.append((
+            tenant_id, industry, snapshot_date, partner,
+            float(primary_value) if pd.notna(primary_value) else None,
+            float(score) if pd.notna(score) else None,
+            risk, band,
+        ))
 
-        if not partner:
-            continue
+    if not records:
+        return
 
-        rows.append(
-            (
-                tenant_id,
-                industry,
-                snapshot_date,
-                partner,
-                float(row.get(primary, 0))
-                if pd.notna(row.get(primary))
-                else None,
-                float(row.get("performance_score", 0))
-                if pd.notna(row.get("performance_score"))
-                else None,
-                row.get("risk"),
-                row.get("band"),
-            )
-        )
+    db_execute(
+        """
+        INSERT OR IGNORE INTO snapshots
+        (tenant_id, industry, snapshot_date, partner, primary_kpi, performance_score, risk, band)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        records,
+        many=True,
+    )
 
-    if rows:
-        db_execute(
-            """
-            INSERT INTO snapshots
-            (tenant_id, industry, snapshot_date, partner,
-             primary_kpi, performance_score, risk, band)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-            many=True,
-        )
+    if dataset_id is not None:
+        st.session_state.last_snapshot_dataset_id = int(dataset_id)
 
 
 # ============================================================
 # 17. TREND ENGINE
 # ============================================================
 
+@st.cache_data(show_spinner=False, ttl=ANALYSIS_CACHE_TTL_SECONDS)
 def trend_analysis(df, industry):
     cfg = INDUSTRIES[industry]
     primary = cfg["primary_kpi"]
@@ -2632,6 +2622,7 @@ def trend_analysis(df, industry):
 # 18. ANOMALY ENGINE
 # ============================================================
 
+@st.cache_data(show_spinner=False, ttl=ANALYSIS_CACHE_TTL_SECONDS)
 def anomaly_analysis(df, industry):
     cfg = INDUSTRIES[industry]
     primary = cfg["primary_kpi"]
@@ -2679,91 +2670,51 @@ def anomaly_analysis(df, industry):
 # 19. PREDICTIVE RISK ENGINE
 # ============================================================
 
+@st.cache_data(show_spinner=False, ttl=ANALYSIS_CACHE_TTL_SECONDS)
 def predictive_risk(df, industry):
-    cfg = INDUSTRIES[industry]
-
+    """Vectorized leading-indicator risk model."""
     result = df.copy()
+    score = pd.to_numeric(result.get("performance_score", pd.Series(0, index=result.index)), errors="coerce").fillna(0)
+    risk = pd.Series(0.0, index=result.index)
+    reason_parts = pd.DataFrame(index=result.index)
 
-    scores = []
-    reasons = []
+    critical = score < 50
+    high = (score >= 50) & (score < 70)
+    moderate = (score >= 70) & (score < 80)
+    risk += critical.astype(float) * 50 + high.astype(float) * 30 + moderate.astype(float) * 15
+    reason_parts["performance"] = pd.Series("", index=result.index)
+    reason_parts.loc[critical, "performance"] = "critical current performance"
+    reason_parts.loc[high, "performance"] = "high performance risk"
+    reason_parts.loc[moderate, "performance"] = "performance below strong range"
 
-    for _, row in result.iterrows():
-        risk_score = 0
-        reason = []
+    pending = pd.to_numeric(result.get("pending", pd.Series(float("nan"), index=result.index)), errors="coerce")
+    pending_pressure = pending.div(10).clip(upper=20).fillna(0)
+    risk += pending_pressure
+    reason_parts["pending"] = pending_pressure.gt(0).map({True: "open workload", False: ""})
 
-        score = row.get("performance_score", 0)
+    aging = pd.to_numeric(result.get("aging", pd.Series(float("nan"), index=result.index)), errors="coerce")
+    aging_pressure = aging.where(aging > 7, 0).clip(upper=20).fillna(0)
+    risk += aging_pressure
+    reason_parts["aging"] = aging_pressure.gt(0).map({True: "aging workload", False: ""})
 
-        if score < 50:
-            risk_score += 50
-            reason.append("critical current performance")
-        elif score < 70:
-            risk_score += 30
-            reason.append("high performance risk")
-        elif score < 80:
-            risk_score += 15
-            reason.append("performance below strong range")
+    quality = pd.to_numeric(result.get("quality", pd.Series(float("nan"), index=result.index)), errors="coerce")
+    quality_pressure = quality.lt(80).fillna(False).astype(float) * 10
+    risk += quality_pressure
+    reason_parts["quality"] = quality_pressure.gt(0).map({True: "quality pressure", False: ""})
 
-        pending = row.get("pending")
+    result["predictive_risk_score"] = risk.clip(upper=100).round(2)
+    result["predicted_risk"] = pd.cut(
+        result["predictive_risk_score"],
+        bins=[-float("inf"), 20, 45, 70, float("inf")],
+        labels=["Low", "Moderate", "Elevated", "Severe"],
+        right=False,
+    ).astype(str)
 
-        if pd.notna(pending) and pending > 0:
-            risk_score += min(
-                20,
-                float(pending) / 10,
-            )
-            reason.append("open workload")
+    def join_reasons(row):
+        values = [str(v) for v in row if str(v).strip()]
+        return ", ".join(values) if values else "No major leading indicators detected."
 
-        aging = row.get("aging")
-
-        if pd.notna(aging) and aging > 7:
-            risk_score += min(
-                20,
-                float(aging),
-            )
-            reason.append("aging workload")
-
-        quality = row.get("quality")
-
-        if pd.notna(quality) and quality < 80:
-            risk_score += 10
-            reason.append("quality pressure")
-
-        risk_score = min(
-            100,
-            round(risk_score, 2),
-        )
-
-        if risk_score >= 70:
-            forecast = "Severe"
-        elif risk_score >= 45:
-            forecast = "Elevated"
-        elif risk_score >= 20:
-            forecast = "Moderate"
-        else:
-            forecast = "Low"
-
-        scores.append(risk_score)
-
-        reasons.append(
-            ", ".join(reason)
-            if reason
-            else "No major leading indicators detected."
-        )
-
-    result["predictive_risk_score"] = scores
-    result["predicted_risk"] = [
-        (
-            "Severe"
-            if s >= 70
-            else "Elevated"
-            if s >= 45
-            else "Moderate"
-            if s >= 20
-            else "Low"
-        )
-        for s in scores
-    ]
-    result["risk_drivers"] = reasons
-
+    result["risk_drivers"] = reason_parts.apply(join_reasons, axis=1)
     return result
 
 
@@ -2771,6 +2722,7 @@ def predictive_risk(df, industry):
 # 20. COMMERCIAL VALUE ENGINE
 # ============================================================
 
+@st.cache_data(show_spinner=False, ttl=ANALYSIS_CACHE_TTL_SECONDS)
 def commercial_value(df, value_per_unit):
     result = df.copy()
 
@@ -2820,24 +2772,32 @@ def save_dataset(
         )
         dataset_id = cur.lastrowid
 
-        payloads = [
-            (dataset_id, tenant_id, industry, json.dumps(row.to_dict(), default=str))
-            for _, row in df.iterrows()
-        ]
-        if payloads:
-            cur.executemany(
-                """
-                INSERT INTO dataset_rows (dataset_id, tenant_id, industry, row_json)
-                VALUES (?, ?, ?, ?)
-                """,
-                payloads,
-            )
+        records = df.to_dict(orient="records")
+        for start_idx in range(0, len(records), MAX_DATASET_INSERT_BATCH):
+            batch = records[start_idx:start_idx + MAX_DATASET_INSERT_BATCH]
+            payloads = [
+                (dataset_id, tenant_id, industry, json.dumps(row, default=str))
+                for row in batch
+            ]
+            if payloads:
+                cur.executemany(
+                    """
+                    INSERT INTO dataset_rows (dataset_id, tenant_id, industry, row_json)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    payloads,
+                )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
 
     audit(
         "DATASET_UPLOADED",
@@ -2848,6 +2808,7 @@ def save_dataset(
     return dataset_id
 
 
+@st.cache_data(show_spinner=False, ttl=ANALYSIS_CACHE_TTL_SECONDS)
 def load_latest_saved_dataset(tenant_id, industry):
     rows = db_execute(
         """
@@ -3059,6 +3020,11 @@ def get_current_data(industry):
     )
 
     if saved is not None:
+        rows = db_execute(
+            "SELECT dataset_id FROM datasets WHERE tenant_id = ? AND industry = ? ORDER BY dataset_id DESC LIMIT 1",
+            (st.session_state.tenant_id, industry), fetch=True
+        )
+        st.session_state.current_dataset_id = int(rows[0]["dataset_id"]) if rows else None
         return normalize_dataframe(saved)
 
     # Customer links never fall back to global/demo operational data.
@@ -3082,12 +3048,14 @@ def set_current_data(df, industry, filename="current_dataset"):
     st.session_state.current_df = normalized
     st.session_state.current_industry = industry
 
-    save_dataset(
+    dataset_id = save_dataset(
         normalized,
         str(filename)[:255],
         quality["status"],
         industry,
     )
+    st.session_state.current_dataset_id = dataset_id
+    st.session_state.last_snapshot_dataset_id = None
 
     return True, quality
 
@@ -4029,7 +3997,13 @@ def read_partnerops_upload(upload):
     else:
         raise ValueError("Unable to process the uploaded file.")
 
-    return _validate_upload_dataframe(result)
+    checked = _validate_upload_dataframe(result)
+    if len(checked) * max(1, len(checked.columns)) > MAX_UPLOAD_CELLS:
+        raise ValueError(
+            f"Dataset contains {len(checked) * max(1, len(checked.columns)):,} cells; "
+            f"the safe processing limit is {MAX_UPLOAD_CELLS:,}."
+        )
+    return checked
 
 
 def ingestion_summary(
@@ -4162,11 +4136,17 @@ else:
         industry,
     )
 
-    save_snapshot(
-        performance_df,
-        industry,
-        st.session_state.tenant_id,
-    )
+    current_dataset_id = st.session_state.get("current_dataset_id")
+    if (
+        current_dataset_id is not None
+        and st.session_state.get("last_snapshot_dataset_id") != current_dataset_id
+    ):
+        save_snapshot(
+            performance_df,
+            industry,
+            st.session_state.tenant_id,
+            dataset_id=current_dataset_id,
+        )
 
 
 # ============================================================
@@ -4188,13 +4168,8 @@ if page == "Contract Management":
     # Executive contract control strip
     active_count = int((contracts_df["status"] == "Active").sum()) if not contracts_df.empty else 0
     expiring_count = int(contracts_df["status"].isin(["Expiring", "Renewal Pending"]).sum()) if not contracts_df.empty else 0
-    breached_count = 0
-    value_at_risk = 0.0
-    if not contracts_df.empty:
-        for cid in contracts_df["contract_id"].tolist():
-            obs = db_execute("SELECT COUNT(*) AS n FROM contract_obligations WHERE tenant_id = ? AND contract_id = ? AND status = 'Breached'", (st.session_state.tenant_id, int(cid)), fetch=True)
-            breached_count += int(obs[0]["n"] or 0)
-            value_at_risk += _contract_value_at_risk(int(cid))
+    breached_count = int(contracts_df["breached_obligations"].sum()) if not contracts_df.empty and "breached_obligations" in contracts_df.columns else 0
+    value_at_risk = float(contracts_df["value_at_risk"].sum()) if not contracts_df.empty and "value_at_risk" in contracts_df.columns else 0.0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Contracts", len(contracts_df))
