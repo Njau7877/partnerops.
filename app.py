@@ -112,7 +112,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.5.2 Deployment Validation & Runtime Hardened"
+APP_VERSION = "5.5.3 Startup & Runtime Hardened"
 
 
 def get_config_value(name, default=None):
@@ -768,9 +768,6 @@ def init_db():
     conn.close()
 
 
-init_db()
-
-
 # ============================================================
 # 5A. CONTRACT MANAGEMENT DATA LAYER
 # ============================================================
@@ -949,9 +946,6 @@ def module_enabled(tenant_id, module_key):
 # Initialize the contract-intelligence schema before any module entitlement
 # queries or default-module seeding. This is required on a fresh deployment
 # as well as on an upgraded 5.2.x database.
-init_contract_db()
-
-
 def ensure_default_modules():
     """Ensure module-entitlement storage exists before seeding tenant defaults.
 
@@ -988,9 +982,6 @@ def ensure_default_modules():
         ],
         many=True,
     )
-
-
-ensure_default_modules()
 
 
 # ============================================================
@@ -1201,9 +1192,6 @@ def init_phase_roadmap_db():
     conn.close()
 
 
-init_phase_roadmap_db()
-
-
 def ensure_schema_metadata():
     """Persist the application schema revision for deployment diagnostics.
 
@@ -1219,9 +1207,6 @@ def ensure_schema_metadata():
         "INSERT OR REPLACE INTO platform_metadata(metadata_key, metadata_value, updated_at) VALUES (?, ?, ?)",
         ("schema_version", SCHEMA_VERSION, timestamp),
     )
-
-
-ensure_schema_metadata()
 
 
 def _phase_rows(sql, params=()):
@@ -2000,13 +1985,69 @@ def seed_data():
         )
 
 
-seed_data()
+@st.cache_resource(show_spinner=False)
+def bootstrap_database():
+    """Initialize the complete database exactly once per Streamlit process.
+
+    The previous 5.5.2 implementation initialized several schema layers while
+    Python was still importing the module. That made Cloud startup sensitive to
+    definition order and caused repeated schema work on Streamlit reruns.
+    5.5.3 performs the same initialization after all required functions are
+    defined and caches the completed bootstrap for the lifetime of the process.
+    """
+    import time
+
+    started = time.perf_counter()
+    print(f"[PartnerOps] startup: bootstrap begin | version={APP_VERSION}", flush=True)
+
+    stages = (
+        ("core_schema", init_db),
+        ("contract_schema", init_contract_db),
+        ("phase_1_4_schema", init_phase_roadmap_db),
+        ("schema_metadata", ensure_schema_metadata),
+        ("seed_data", seed_data),
+        ("module_entitlements", ensure_default_modules),
+    )
+
+    for stage_name, stage_fn in stages:
+        stage_started = time.perf_counter()
+        print(f"[PartnerOps] startup: {stage_name} begin", flush=True)
+        try:
+            stage_fn()
+        except Exception:
+            logger.exception("PartnerOps startup failed during stage=%s", stage_name)
+            print(f"[PartnerOps] startup: {stage_name} FAILED", flush=True)
+            raise
+        elapsed = time.perf_counter() - stage_started
+        print(f"[PartnerOps] startup: {stage_name} complete | {elapsed:.2f}s", flush=True)
+
+    health = database_runtime_check()
+    print(
+        "[PartnerOps] startup: database health | "
+        f"connection={health.get('connection')} "
+        f"integrity={health.get('integrity')} "
+        f"foreign_keys={health.get('foreign_keys')} "
+        f"journal={health.get('journal_mode')}",
+        flush=True,
+    )
+
+    if not (health.get("connection") and health.get("integrity") and health.get("foreign_keys")):
+        logger.critical("PartnerOps database runtime check failed: %s", health)
+        raise RuntimeError("PartnerOps database integrity validation failed during startup.")
+
+    elapsed = time.perf_counter() - started
+    print(f"[PartnerOps] startup: bootstrap complete | {elapsed:.2f}s", flush=True)
+    return health
 
 
-RUNTIME_HEALTH = database_runtime_check()
-if not (RUNTIME_HEALTH.get("connection") and RUNTIME_HEALTH.get("integrity") and RUNTIME_HEALTH.get("foreign_keys")):
-    logger.critical("PartnerOps database runtime check failed: %s", RUNTIME_HEALTH)
-    st.error("PartnerOps could not verify database integrity. Startup has been stopped safely.")
+try:
+    RUNTIME_HEALTH = bootstrap_database()
+except Exception as startup_exc:
+    logger.exception("PartnerOps startup aborted safely: %s", type(startup_exc).__name__)
+    st.error(
+        "PartnerOps could not complete its startup validation. "
+        "The application has been stopped safely. Check the deployment logs for the startup stage that failed."
+    )
     st.stop()
 
 
