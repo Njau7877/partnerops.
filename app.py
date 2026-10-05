@@ -112,7 +112,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.5.0 Phase 1-4 Control Platform"
+APP_VERSION = "5.5.1 Deployment & Runtime Hardened"
 
 
 def get_config_value(name, default=None):
@@ -136,6 +136,13 @@ def get_config_value(name, default=None):
 
 
 DB_FILE = get_config_value("PARTNEROPS_DB", "partnerops.db")
+try:
+    _db_parent = os.path.dirname(os.path.abspath(DB_FILE))
+    if _db_parent:
+        os.makedirs(_db_parent, exist_ok=True)
+except OSError:
+    pass
+
 BASE_URL = str(
     get_config_value(
         "PARTNEROPS_BASE_URL",
@@ -549,12 +556,13 @@ def get_db():
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA synchronous = NORMAL")
-    try:
-        conn.execute("PRAGMA journal_mode = WAL")
-    except sqlite3.DatabaseError:
-        # WAL may be unavailable on unusual filesystems; normal SQLite mode
-        # is still fully functional for the pilot application.
-        pass
+    if DB_FILE != ":memory:":
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.DatabaseError:
+            # WAL may be unavailable on unusual filesystems; normal SQLite mode
+            # remains functional for the pilot application.
+            pass
     return conn
 
 
@@ -2316,6 +2324,52 @@ def revalidate_customer_session():
 revalidate_customer_session()
 
 
+
+def clear_authenticated_session():
+    """Clear authentication/session state without leaving stale tenant scope."""
+    for key in DEFAULT_STATE:
+        st.session_state[key] = DEFAULT_STATE[key]
+
+
+def revalidate_platform_session():
+    """Re-check platform-user status, tenant status and session lifetime."""
+    if not st.session_state.get("authenticated") or st.session_state.get("access_mode") != "platform":
+        return
+    tenant_id = st.session_state.get("tenant_id")
+    username = st.session_state.get("username")
+    if not tenant_id or not username:
+        clear_authenticated_session()
+        st.error("Your session is incomplete. Please sign in again.")
+        st.stop()
+    rows = db_execute(
+        """SELECT u.user_id, u.role, u.status AS user_status, t.status AS tenant_status
+           FROM users u JOIN tenants t ON t.tenant_id = u.tenant_id
+           WHERE u.tenant_id = ? AND u.username = ? LIMIT 1""",
+        (tenant_id, username), fetch=True,
+    )
+    if not rows or rows[0]["user_status"] != "active" or rows[0]["tenant_status"] != "active":
+        audit("PLATFORM_SESSION_REVOKED", "user", username, {"reason": "user_or_tenant_inactive"}, tenant_id=tenant_id, username=username)
+        clear_authenticated_session()
+        st.error("Your account or tenant is no longer active. Please sign in again.")
+        st.stop()
+    now = utc_now()
+    try:
+        started = datetime.fromisoformat(st.session_state.get("session_started_at"))
+        last = datetime.fromisoformat(st.session_state.get("last_activity_at"))
+        if started.tzinfo is None: started = started.replace(tzinfo=timezone.utc)
+        if last.tzinfo is None: last = last.replace(tzinfo=timezone.utc)
+    except Exception:
+        started = now
+        last = now
+        st.session_state.session_started_at = now.isoformat()
+    if now - last > timedelta(minutes=SESSION_IDLE_MINUTES) or now - started > timedelta(minutes=SESSION_MAX_MINUTES):
+        audit("PLATFORM_SESSION_EXPIRED", "user", username, {"reason": "session_timeout"}, tenant_id=tenant_id, username=username)
+        clear_authenticated_session()
+        st.error("Your session expired. Please sign in again.")
+        st.stop()
+    st.session_state.role = rows[0]["role"]
+    st.session_state.last_activity_at = now.isoformat()
+
 # ============================================================
 # 12. LOGIN
 # ============================================================
@@ -2489,6 +2543,20 @@ if not st.session_state.authenticated:
     login_screen()
     st.stop()
 
+revalidate_platform_session()
+
+with st.sidebar:
+    if st.button("Sign out", use_container_width=True):
+        audit(
+            "LOGOUT",
+            "user",
+            st.session_state.get("username") or "customer_link",
+            {"access_mode": st.session_state.get("access_mode")},
+            tenant_id=st.session_state.get("tenant_id"),
+            username=st.session_state.get("username"),
+        )
+        clear_authenticated_session()
+        st.rerun()
 
 enforce_scope()
 
