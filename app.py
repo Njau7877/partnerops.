@@ -1272,15 +1272,54 @@ def phase1_tprm_page():
             st.dataframe(assessments[[c for c in ["assessment_id","entity_id","assessment_date","overall_score","risk_level","findings","next_review_date"] if c in assessments.columns]], use_container_width=True, hide_index=True)
     with tabs[2]:
         controls=pd.DataFrame(_phase_rows("SELECT * FROM tprm_controls WHERE tenant_id = ? ORDER BY control_id DESC", (tenant_id,)))
-        if not controls.empty: st.dataframe(controls, use_container_width=True, hide_index=True)
-        if not incidents.empty: 
-            st.subheader("Incident Register")
+        if not controls.empty:
+            st.subheader("Control Register")
+            st.dataframe(controls, use_container_width=True, hide_index=True)
+        if _phase_write_allowed() and not entities.empty:
+            opts={f"{r['name']} (ID {r['entity_id']})":int(r['entity_id']) for _,r in entities.iterrows()}
+            with st.form("tprm_control_form", clear_on_submit=True):
+                a,b=st.columns(2)
+                with a:
+                    entity_label=st.selectbox("Third party", list(opts), key="tprm_control_entity")
+                    control_name=st.text_input("Control name *", value="Quarterly risk review")
+                    control_type=st.selectbox("Control type", ["Preventive","Detective","Corrective"])
+                with b:
+                    control_owner=st.text_input("Control owner")
+                    control_due=st.date_input("Due date", value=utc_now().date()+timedelta(days=30), key="tprm_control_due")
+                    control_status=st.selectbox("Status", ["Open","In Progress","Effective","Overdue","Closed"])
+                evidence_required=st.text_input("Evidence required")
+                effectiveness=st.slider("Effectiveness", 0, 100, 50)
+                if st.form_submit_button("Add Control", use_container_width=True) and control_name.strip():
+                    db_execute("INSERT INTO tprm_controls(tenant_id,entity_id,control_name,control_type,owner,due_date,status,evidence_required,effectiveness,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (tenant_id,opts[entity_label],control_name.strip(),control_type,control_owner.strip() or None,_contract_date(control_due),control_status,evidence_required.strip() or None,float(effectiveness),utc_iso()))
+                    audit("TPRM_CONTROL_CREATED","tprm_control",control_name.strip(),{"entity_id":opts[entity_label]})
+                    st.rerun()
+        st.divider()
+        st.subheader("Incident Register")
+        if not incidents.empty:
             st.dataframe(incidents, use_container_width=True, hide_index=True)
+        if _phase_write_allowed() and not entities.empty:
+            opts={f"{r['name']} (ID {r['entity_id']})":int(r['entity_id']) for _,r in entities.iterrows()}
+            with st.form("tprm_incident_form", clear_on_submit=True):
+                a,b=st.columns(2)
+                with a:
+                    incident_entity=st.selectbox("Third party", list(opts), key="tprm_incident_entity")
+                    incident_date=st.date_input("Incident date", value=utc_now().date(), key="tprm_incident_date")
+                    severity=st.selectbox("Severity", ["Low","Medium","High","Critical"])
+                with b:
+                    category=st.text_input("Category", value="Operational")
+                    incident_status=st.selectbox("Status", ["Open","Investigating","Resolved","Closed"])
+                    impact=st.number_input("Financial impact", min_value=0.0, value=0.0)
+                description=st.text_area("Description")
+                incident_owner=st.text_input("Incident owner")
+                if st.form_submit_button("Record Incident", use_container_width=True):
+                    db_execute("INSERT INTO tprm_incidents(tenant_id,entity_id,incident_date,severity,category,description,financial_impact,status,owner,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)", (tenant_id,opts[incident_entity],_contract_date(incident_date),severity,category.strip() or None,description.strip() or None,float(impact),incident_status,incident_owner.strip() or None,utc_iso()))
+                    audit("TPRM_INCIDENT_CREATED","tprm_incident",opts[incident_entity],{"severity":severity,"financial_impact":impact})
+                    st.rerun()
 
 
 def phase2_process_page():
     st.title("⚙️ Process Intelligence")
-    st.caption("Phase 2 · Process → bottleneck → predictive risk → intervention priority")
+    st.caption("Phase 2 · Process → bottleneck → risk signal → intervention priority")
     tenant_id=_phase_tenant()
     events=pd.DataFrame(_phase_rows("SELECT * FROM process_events WHERE tenant_id = ? ORDER BY event_id DESC", (tenant_id,)))
     metrics=pd.DataFrame(_phase_rows("SELECT * FROM process_metrics WHERE tenant_id = ? ORDER BY metric_id DESC", (tenant_id,)))
@@ -1318,8 +1357,11 @@ def phase2_process_page():
         st.subheader("Current Process Risk")
         st.dataframe(agg, use_container_width=True, hide_index=True)
         if _phase_write_allowed() and st.button("Persist Current Process Intelligence", use_container_width=True):
+            period_start=str(events["event_date"].min())
+            period_end=str(events["event_date"].max())
             for _,r in agg.iterrows():
-                db_execute("INSERT INTO process_metrics(tenant_id,process_name,period_start,period_end,throughput,completion_rate,avg_cycle_time,backlog,failure_rate,bottleneck_score,risk_score,diagnosis,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (tenant_id,str(r["process_name"]),str(events["event_date"].min()),str(events["event_date"].max()),float(r["volume"]),float(max(0,100-r["failure_rate"]-r["backlog_rate"])),float(r["avg_cycle"]),float(r["pending"]),float(r["failure_rate"]),float(r["bottleneck_score"]),float(r["bottleneck_score"]),f"Primary process pressure is driven by failure/backlog/cycle-time signals; risk band {_risk_level(r['bottleneck_score'])}.",utc_iso()))
+                db_execute("DELETE FROM process_metrics WHERE tenant_id=? AND process_name=? AND period_start=? AND period_end=?", (tenant_id,str(r["process_name"]),period_start,period_end))
+                db_execute("INSERT INTO process_metrics(tenant_id,process_name,period_start,period_end,throughput,completion_rate,avg_cycle_time,backlog,failure_rate,bottleneck_score,risk_score,diagnosis,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (tenant_id,str(r["process_name"]),period_start,period_end,float(r["volume"]),float(max(0,100-r["failure_rate"]-r["backlog_rate"])),float(r["avg_cycle"]),float(r["pending"]),float(r["failure_rate"]),float(r["bottleneck_score"]),float(r["bottleneck_score"]),f"Primary process pressure is driven by failure/backlog/cycle-time signals; risk band {_risk_level(r['bottleneck_score'])}.",utc_iso()))
             audit("PROCESS_INTELLIGENCE_PERSISTED","process_metrics","batch",{"processes":len(agg)})
             st.success("Process intelligence persisted.")
             st.rerun()
@@ -1329,7 +1371,7 @@ def phase2_process_page():
 
 
 def phase3_knowledge_page():
-    st.title("🧠 Knowledge Graph & Governed Agents")
+    st.title("🧠 Knowledge Graph & Governed Triage")
     st.caption("Phase 3 · Evidence graph → governed reasoning → human approval → controlled action")
     tenant_id=_phase_tenant()
     entities=pd.DataFrame(_phase_rows("SELECT * FROM knowledge_entities WHERE tenant_id = ? ORDER BY knowledge_entity_id DESC", (tenant_id,)))
@@ -1375,8 +1417,15 @@ def phase3_knowledge_page():
                 actions=[]
                 contracts=_phase_rows("SELECT contract_number,title,risk_level FROM contracts WHERE tenant_id=? AND status NOT IN ('Expired','Terminated') ORDER BY CASE risk_level WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END LIMIT 5",(tenant_id,))
                 tprm=_phase_rows("SELECT e.name,a.overall_score,a.risk_level FROM tprm_entities e JOIN tprm_assessments a ON a.entity_id=e.entity_id WHERE e.tenant_id=? ORDER BY a.assessment_id DESC LIMIT 5",(tenant_id,))
+                process=_phase_rows("SELECT process_name,bottleneck_score,risk_score,diagnosis FROM process_metrics WHERE tenant_id=? ORDER BY metric_id DESC LIMIT 5",(tenant_id,))
+                graph_counts=_phase_rows("SELECT COUNT(*) AS n FROM knowledge_entities WHERE tenant_id=?",(tenant_id,))
+                relation_counts=_phase_rows("SELECT COUNT(*) AS n FROM knowledge_relations WHERE tenant_id=?",(tenant_id,))
                 if contracts: evidence.append(f"Contract risk records available: {len(contracts)}")
                 if tprm: evidence.append(f"Recent TPRM assessments available: {len(tprm)}")
+                if process: evidence.append(f"Persisted process-risk records available: {len(process)}")
+                if graph_counts and int(graph_counts[0].get("n") or 0): evidence.append(f"Knowledge entities available: {int(graph_counts[0].get('n') or 0)}")
+                if relation_counts and int(relation_counts[0].get("n") or 0): evidence.append(f"Knowledge relationships available: {int(relation_counts[0].get('n') or 0)}")
+                process_high=process and max(float(x.get("risk_score") or 0) for x in process)>=65
                 if contracts and any(str(x.get("risk_level")) in ("High","Critical") for x in contracts):
                     decision="Prioritize high-risk contractual counterparties for controlled review."
                     actions.append("Open or refresh a contract/TPrm review with named owner and due date.")
@@ -1385,6 +1434,10 @@ def phase3_knowledge_page():
                     decision="Prioritize high-risk third parties for remediation."
                     actions.append("Assign a risk-control remediation action and evidence deadline.")
                     confidence=0.82
+                elif process_high:
+                    decision="Prioritize the highest-risk process bottleneck for controlled review."
+                    actions.append("Assign a process recovery owner and validate the underlying cycle-time, backlog and failure evidence.")
+                    confidence=0.80
                 else:
                     decision="No high-confidence critical control issue identified from the currently registered evidence."
                     actions.append("Collect more operational/contract evidence before escalating.")
@@ -1460,8 +1513,11 @@ def phase4_value_page():
                     notes=st.text_area("Assumption / evidence note")
                     if st.form_submit_button("Calculate & Store Scenario",use_container_width=True):
                         sr=scenarios[scenarios["scenario_id"]==sc_opts[sc]].iloc[0]
-                        gross=max(0.0,float(scenario_value)-float(baseline))
-                        risk_adj=gross*float(sr.get("probability") or 0)
+                        driver_row=drivers[drivers["driver_id"]==dr_opts[dr]].iloc[0]
+                        raw_delta=max(0.0,float(scenario_value)-float(baseline))
+                        value_per_unit=float(driver_row.get("value_per_unit") or 0)
+                        gross=raw_delta*value_per_unit if value_per_unit > 0 else raw_delta
+                        risk_adj=gross*max(0.0,min(1.0,float(sr.get("probability") or 0)))
                         db_execute("INSERT INTO scenario_results(tenant_id,scenario_id,driver_id,baseline_value,scenario_value,gross_value,risk_adjusted_value,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)",(tenant_id,sc_opts[sc],dr_opts[dr],float(baseline),float(scenario_value),gross,risk_adj,notes.strip() or None,utc_iso()))
                         audit("SCENARIO_CALCULATED","scenario_result",sc_opts[sc],{"gross_value":gross,"risk_adjusted_value":risk_adj})
                         st.rerun()
