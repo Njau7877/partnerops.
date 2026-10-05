@@ -112,7 +112,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.5.1 Deployment & Runtime Hardened"
+APP_VERSION = "5.5.2 Deployment Validation & Runtime Hardened"
 
 
 def get_config_value(name, default=None):
@@ -175,6 +175,9 @@ MAX_UPLOAD_COLUMNS = max(20, min(MAX_UPLOAD_COLUMNS, 500))
 MAX_UPLOAD_CELLS = min(MAX_UPLOAD_ROWS * MAX_UPLOAD_COLUMNS, 10_000_000)
 MAX_DATASET_INSERT_BATCH = 1000
 ANALYSIS_CACHE_TTL_SECONDS = 900
+DB_BUSY_RETRY_COUNT = 4
+DB_BUSY_RETRY_SLEEP_SECONDS = 0.25
+SCHEMA_VERSION = "5.5.2"
 MAX_ZIP_MEMBERS = 5000
 MAX_ZIP_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_IMAGE_PIXELS = 50_000_000
@@ -550,38 +553,72 @@ def has_permission(permission):
 # ============================================================
 
 def get_db():
-    """Open a resilient SQLite connection for Streamlit Cloud and local use."""
-    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
+    """Open a resilient SQLite connection with safe runtime defaults."""
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
     if DB_FILE != ":memory:":
         try:
             conn.execute("PRAGMA journal_mode = WAL")
         except sqlite3.DatabaseError:
-            # WAL may be unavailable on unusual filesystems; normal SQLite mode
-            # remains functional for the pilot application.
             pass
     return conn
 
 
 def db_execute(sql, params=(), fetch=False, many=False):
-    conn = get_db()
-    cur = conn.cursor()
+    """Execute a DB operation transactionally and retry transient SQLite locks."""
+    last_error = None
+    import time
+    for attempt in range(DB_BUSY_RETRY_COUNT):
+        conn = get_db()
+        try:
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+            if many:
+                cur.executemany(sql, params)
+            else:
+                cur.execute(sql, params)
+            result = cur.fetchall() if fetch else None
+            conn.commit()
+            return result
+        except sqlite3.OperationalError as exc:
+            try: conn.rollback()
+            except sqlite3.DatabaseError: pass
+            last_error = exc
+            message = str(exc).lower()
+            if "locked" not in message and "busy" not in message:
+                raise
+            if attempt + 1 >= DB_BUSY_RETRY_COUNT:
+                raise
+            time.sleep(DB_BUSY_RETRY_SLEEP_SECONDS * (attempt + 1))
+        except Exception:
+            try: conn.rollback()
+            except sqlite3.DatabaseError: pass
+            raise
+        finally:
+            conn.close()
+    raise last_error
+
+
+def database_runtime_check():
+    """Verify DB connectivity/integrity without exposing secrets or customer data."""
+    result = {"connection": False, "foreign_keys": False, "integrity": False, "schema_tables": False, "journal_mode": "unknown"}
+    conn = None
     try:
-        if many:
-            cur.executemany(sql, params)
-        else:
-            cur.execute(sql, params)
-        result = cur.fetchall() if fetch else None
-        conn.commit()
-        return result
-    except Exception:
-        conn.rollback()
-        raise
+        conn = get_db()
+        result["connection"] = True
+        result["foreign_keys"] = int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) == 1
+        result["journal_mode"] = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        result["integrity"] = str(conn.execute("PRAGMA integrity_check").fetchone()[0]).lower() == "ok"
+        result["schema_tables"] = int(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]) > 0
+    except Exception as exc:
+        result["error"] = type(exc).__name__
     finally:
-        conn.close()
+        if conn is not None: conn.close()
+    return result
 
 
 def init_db():
@@ -1165,6 +1202,15 @@ def init_phase_roadmap_db():
 
 
 init_phase_roadmap_db()
+
+
+def ensure_schema_metadata():
+    """Persist the application schema revision for deployment diagnostics."""
+    db_execute("CREATE TABLE IF NOT EXISTS platform_metadata (metadata_key TEXT PRIMARY KEY, metadata_value TEXT NOT NULL, updated_at TEXT NOT NULL)")
+    db_execute("INSERT OR REPLACE INTO platform_metadata(metadata_key, metadata_value, updated_at) VALUES (?, ?, ?)", ("schema_version", SCHEMA_VERSION, utc_iso()))
+
+
+ensure_schema_metadata()
 
 
 def _phase_rows(sql, params=()):
@@ -1944,6 +1990,13 @@ def seed_data():
 
 
 seed_data()
+
+
+RUNTIME_HEALTH = database_runtime_check()
+if not (RUNTIME_HEALTH.get("connection") and RUNTIME_HEALTH.get("integrity") and RUNTIME_HEALTH.get("foreign_keys")):
+    logger.critical("PartnerOps database runtime check failed: %s", RUNTIME_HEALTH)
+    st.error("PartnerOps could not verify database integrity. Startup has been stopped safely.")
+    st.stop()
 
 
 # ============================================================
@@ -7054,6 +7107,18 @@ elif page == "Administration":
                 {
                     "Control": "Access Link Expiry",
                     "Value": "Enabled",
+                },
+                {
+                    "Control": "Database Integrity",
+                    "Value": "PASS" if RUNTIME_HEALTH.get("integrity") else "FAIL",
+                },
+                {
+                    "Control": "SQLite Journal",
+                    "Value": RUNTIME_HEALTH.get("journal_mode", "unknown"),
+                },
+                {
+                    "Control": "Schema Version",
+                    "Value": SCHEMA_VERSION,
                 },
             ]
         )
