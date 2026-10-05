@@ -1,7 +1,9 @@
 # ============================================================
-# PARTNEROPS 5.4 PERFORMANCE & ARCHITECTURE HARDENED
+# PARTNEROPS 5.5 PHASE 1-4 CONTROL PLATFORM
 # SINGLE-SOURCE-OF-TRUTH APPLICATION
 #
+# 5.5 ROADMAP: Phase 1 TPRM, Phase 2 Process Intelligence + Predictive Risk,
+# Phase 3 Knowledge Graph + Governed Agents, Phase 4 Financial Value + Scenario Simulation.
 # 5.4 HARDENING: cached deterministic intelligence, vectorized scoring,
 # bounded ingestion, batched persistence, daily snapshot idempotency,
 # tenant-scoped dataset identity, and reduced CMS query fan-out.
@@ -110,7 +112,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.4.1 Stabilized Performance & Architecture Hardened"
+APP_VERSION = "5.5.0 Phase 1-4 Control Platform"
 
 
 def get_config_value(name, default=None):
@@ -944,6 +946,529 @@ def ensure_default_modules():
 
 
 ensure_default_modules()
+
+
+# ============================================================
+# 10A. PHASE 1-4 CONTROL-PLATFORM DATA LAYER
+# ============================================================
+# These tables extend PartnerOps without replacing the existing 5.4.1
+# performance/CMS schema. Every record is tenant-scoped and auditable.
+
+def init_phase_roadmap_db():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tprm_entities (
+            entity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            entity_type TEXT NOT NULL DEFAULT 'Third Party',
+            name TEXT NOT NULL,
+            category TEXT,
+            criticality TEXT DEFAULT 'Medium',
+            owner TEXT,
+            contract_id INTEGER,
+            status TEXT DEFAULT 'Active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tprm_entities_tenant ON tprm_entities(tenant_id, status);
+
+        CREATE TABLE IF NOT EXISTS tprm_assessments (
+            assessment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            assessment_date TEXT NOT NULL,
+            cyber_score REAL DEFAULT 0,
+            financial_score REAL DEFAULT 0,
+            operational_score REAL DEFAULT 0,
+            compliance_score REAL DEFAULT 0,
+            concentration_score REAL DEFAULT 0,
+            overall_score REAL DEFAULT 0,
+            risk_level TEXT DEFAULT 'Medium',
+            findings TEXT,
+            assessor TEXT,
+            next_review_date TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(entity_id) REFERENCES tprm_entities(entity_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_tprm_assessments_entity ON tprm_assessments(tenant_id, entity_id, assessment_date);
+
+        CREATE TABLE IF NOT EXISTS tprm_controls (
+            control_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            control_name TEXT NOT NULL,
+            control_type TEXT DEFAULT 'Preventive',
+            owner TEXT,
+            due_date TEXT,
+            status TEXT DEFAULT 'Open',
+            evidence_required TEXT,
+            effectiveness REAL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(entity_id) REFERENCES tprm_entities(entity_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_tprm_controls_entity ON tprm_controls(tenant_id, entity_id, status);
+
+        CREATE TABLE IF NOT EXISTS tprm_incidents (
+            incident_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            incident_date TEXT NOT NULL,
+            severity TEXT DEFAULT 'Medium',
+            category TEXT,
+            description TEXT,
+            financial_impact REAL DEFAULT 0,
+            status TEXT DEFAULT 'Open',
+            owner TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(entity_id) REFERENCES tprm_entities(entity_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_tprm_incidents_entity ON tprm_incidents(tenant_id, entity_id, status);
+
+        CREATE TABLE IF NOT EXISTS process_events (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            process_name TEXT NOT NULL,
+            process_step TEXT,
+            event_date TEXT NOT NULL,
+            entity_name TEXT,
+            volume REAL DEFAULT 0,
+            cycle_time_hours REAL,
+            outcome TEXT,
+            status TEXT DEFAULT 'Completed',
+            owner TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_process_events_tenant ON process_events(tenant_id, process_name, event_date);
+
+        CREATE TABLE IF NOT EXISTS process_metrics (
+            metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            process_name TEXT NOT NULL,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            throughput REAL DEFAULT 0,
+            completion_rate REAL DEFAULT 0,
+            avg_cycle_time REAL DEFAULT 0,
+            backlog REAL DEFAULT 0,
+            failure_rate REAL DEFAULT 0,
+            bottleneck_score REAL DEFAULT 0,
+            risk_score REAL DEFAULT 0,
+            diagnosis TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_process_metrics_tenant ON process_metrics(tenant_id, process_name, period_end);
+
+        CREATE TABLE IF NOT EXISTS knowledge_entities (
+            knowledge_entity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            label TEXT NOT NULL,
+            source_type TEXT,
+            source_id TEXT,
+            confidence REAL DEFAULT 1.0,
+            created_at TEXT NOT NULL,
+            UNIQUE(tenant_id, entity_type, entity_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_entities_tenant ON knowledge_entities(tenant_id, entity_type);
+
+        CREATE TABLE IF NOT EXISTS knowledge_relations (
+            relation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            from_entity_id INTEGER NOT NULL,
+            relation_type TEXT NOT NULL,
+            to_entity_id INTEGER NOT NULL,
+            confidence REAL DEFAULT 1.0,
+            source_type TEXT,
+            source_id TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(tenant_id, from_entity_id, relation_type, to_entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_knowledge_relations_tenant ON knowledge_relations(tenant_id, relation_type);
+
+        CREATE TABLE IF NOT EXISTS agent_runs (
+            agent_run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            scope TEXT,
+            decision TEXT,
+            evidence TEXT,
+            recommended_action TEXT,
+            confidence REAL DEFAULT 0,
+            approval_status TEXT DEFAULT 'Pending',
+            approved_by TEXT,
+            approved_at TEXT,
+            executed_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_runs_tenant ON agent_runs(tenant_id, approval_status, created_at);
+
+        CREATE TABLE IF NOT EXISTS value_drivers (
+            driver_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            unit TEXT DEFAULT 'KES',
+            baseline REAL DEFAULT 0,
+            current_value REAL DEFAULT 0,
+            target_value REAL DEFAULT 0,
+            value_per_unit REAL DEFAULT 0,
+            owner TEXT,
+            status TEXT DEFAULT 'Active',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_value_drivers_tenant ON value_drivers(tenant_id, status);
+
+        CREATE TABLE IF NOT EXISTS scenarios (
+            scenario_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT,
+            horizon_days INTEGER DEFAULT 90,
+            probability REAL DEFAULT 1.0,
+            assumptions_json TEXT,
+            created_by TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scenarios_tenant ON scenarios(tenant_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS scenario_results (
+            result_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            scenario_id INTEGER NOT NULL,
+            driver_id INTEGER,
+            baseline_value REAL DEFAULT 0,
+            scenario_value REAL DEFAULT 0,
+            gross_value REAL DEFAULT 0,
+            risk_adjusted_value REAL DEFAULT 0,
+            notes TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(scenario_id) REFERENCES scenarios(scenario_id) ON DELETE CASCADE,
+            FOREIGN KEY(driver_id) REFERENCES value_drivers(driver_id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scenario_results_tenant ON scenario_results(tenant_id, scenario_id);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+init_phase_roadmap_db()
+
+
+def _phase_rows(sql, params=()):
+    return [dict(r) for r in db_execute(sql, params, fetch=True)]
+
+
+def _phase_tenant():
+    return st.session_state.get("tenant_id")
+
+
+def _phase_write_allowed():
+    return has_permission("write") or has_permission("admin") or st.session_state.get("role") in {"admin", "manager"}
+
+
+def _risk_level(score):
+    score = float(score or 0)
+    if score >= 80:
+        return "Critical"
+    if score >= 65:
+        return "High"
+    if score >= 40:
+        return "Medium"
+    return "Low"
+
+
+def _phase4_money(value):
+    return f"KES {float(value or 0):,.0f}"
+
+
+def _phase1_score(values):
+    vals = [max(0.0, min(100.0, float(v or 0))) for v in values]
+    return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+
+def _sync_contracts_to_tprm():
+    tenant_id = _phase_tenant()
+    rows = _phase_rows("SELECT contract_id, counterparty, partner_name, risk_level, owner, status FROM contracts WHERE tenant_id = ?", (tenant_id,))
+    created = 0
+    for r in rows:
+        name = r.get("partner_name") or r.get("counterparty") or f"Contract {r['contract_id']}"
+        exists = _phase_rows("SELECT entity_id FROM tprm_entities WHERE tenant_id = ? AND contract_id = ? LIMIT 1", (tenant_id, r["contract_id"]))
+        if not exists:
+            criticality = {"Critical": "Critical", "High": "High", "Medium": "Medium", "Low": "Low"}.get(r.get("risk_level"), "Medium")
+            db_execute("""INSERT INTO tprm_entities(tenant_id, entity_type, name, category, criticality, owner, contract_id, status, created_at, updated_at)
+                          VALUES (?, 'Contracted Third Party', ?, 'Contract Counterparty', ?, ?, ?, ?, ?, ?)""",
+                       (tenant_id, name, criticality, r.get("owner"), r["contract_id"], r.get("status") or "Active", utc_iso(), utc_iso()))
+            created += 1
+    return created
+
+
+def phase1_tprm_page():
+    st.title("🛡️ Third-Party Risk Management")
+    st.caption("Phase 1 · Third party → risk → control → incident → remediation → residual risk")
+    tenant_id = _phase_tenant()
+    synced = _sync_contracts_to_tprm()
+    if synced:
+        st.success(f"Synchronized {synced} contract counterparty record(s) into the TPRM register.")
+
+    entities = pd.DataFrame(_phase_rows("SELECT * FROM tprm_entities WHERE tenant_id = ? ORDER BY entity_id DESC", (tenant_id,)))
+    assessments = pd.DataFrame(_phase_rows("SELECT * FROM tprm_assessments WHERE tenant_id = ? ORDER BY assessment_date DESC", (tenant_id,)))
+    incidents = pd.DataFrame(_phase_rows("SELECT * FROM tprm_incidents WHERE tenant_id = ? ORDER BY incident_id DESC", (tenant_id,)))
+    high_risk = int((assessments["risk_level"].isin(["High", "Critical"])).sum()) if not assessments.empty else 0
+    open_incidents = int((incidents["status"].isin(["Open", "Investigating"])).sum()) if not incidents.empty else 0
+    avg_risk = float(assessments["overall_score"].mean()) if not assessments.empty else 0
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Third Parties", len(entities))
+    c2.metric("High / Critical Assessments", high_risk)
+    c3.metric("Open Incidents", open_incidents)
+    c4.metric("Average Risk Score", f"{avg_risk:.1f}/100")
+
+    tabs=st.tabs(["Register","Assessments","Controls & Incidents"])
+    with tabs[0]:
+        if not entities.empty:
+            st.dataframe(entities[[c for c in ["entity_id","name","entity_type","category","criticality","owner","contract_id","status"] if c in entities.columns]], use_container_width=True, hide_index=True)
+        if _phase_write_allowed():
+            with st.form("tprm_entity_form", clear_on_submit=True):
+                a,b=st.columns(2)
+                with a:
+                    name=st.text_input("Third party name *")
+                    category=st.text_input("Category", value="Supplier / Contractor")
+                    owner=st.text_input("Risk owner")
+                with b:
+                    criticality=st.selectbox("Criticality", ["Low","Medium","High","Critical"], index=1)
+                    status=st.selectbox("Status", ["Active","Under Review","Suspended","Exited"])
+                if st.form_submit_button("Add Third Party", use_container_width=True):
+                    if name.strip():
+                        db_execute("INSERT INTO tprm_entities(tenant_id,name,category,criticality,owner,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", (tenant_id,name.strip(),category.strip(),criticality,owner.strip() or None,status,utc_iso(),utc_iso()))
+                        audit("TPRM_ENTITY_CREATED","tprm_entity",name.strip(),{"criticality":criticality})
+                        st.rerun()
+                    else: st.error("Third party name is required.")
+    with tabs[1]:
+        if not entities.empty:
+            opts={f"{r['name']} (ID {r['entity_id']})":int(r['entity_id']) for _,r in entities.iterrows()}
+            with st.form("tprm_assessment_form", clear_on_submit=True):
+                label=st.selectbox("Third party", list(opts))
+                a,b,c=st.columns(3)
+                with a:
+                    cyber=st.slider("Cyber / information risk",0,100,30)
+                    financial=st.slider("Financial risk",0,100,30)
+                with b:
+                    operational=st.slider("Operational risk",0,100,30)
+                    compliance=st.slider("Compliance risk",0,100,30)
+                with c:
+                    concentration=st.slider("Concentration risk",0,100,30)
+                    next_review=st.date_input("Next review", value=utc_now().date()+timedelta(days=90))
+                findings=st.text_area("Findings")
+                if st.form_submit_button("Record Risk Assessment", use_container_width=True):
+                    score=_phase1_score([cyber,financial,operational,compliance,concentration])
+                    db_execute("""INSERT INTO tprm_assessments(tenant_id,entity_id,assessment_date,cyber_score,financial_score,operational_score,compliance_score,concentration_score,overall_score,risk_level,findings,assessor,next_review_date,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (tenant_id,opts[label],_contract_date(utc_now().date()),cyber,financial,operational,compliance,concentration,score,_risk_level(score),findings.strip() or None,st.session_state.username,_contract_date(next_review),utc_iso()))
+                    audit("TPRM_ASSESSMENT_CREATED","tprm_assessment",opts[label],{"risk_score":score,"risk_level":_risk_level(score)})
+                    st.rerun()
+        if not assessments.empty:
+            st.dataframe(assessments[[c for c in ["assessment_id","entity_id","assessment_date","overall_score","risk_level","findings","next_review_date"] if c in assessments.columns]], use_container_width=True, hide_index=True)
+    with tabs[2]:
+        controls=pd.DataFrame(_phase_rows("SELECT * FROM tprm_controls WHERE tenant_id = ? ORDER BY control_id DESC", (tenant_id,)))
+        if not controls.empty: st.dataframe(controls, use_container_width=True, hide_index=True)
+        if not incidents.empty: 
+            st.subheader("Incident Register")
+            st.dataframe(incidents, use_container_width=True, hide_index=True)
+
+
+def phase2_process_page():
+    st.title("⚙️ Process Intelligence")
+    st.caption("Phase 2 · Process → bottleneck → predictive risk → intervention priority")
+    tenant_id=_phase_tenant()
+    events=pd.DataFrame(_phase_rows("SELECT * FROM process_events WHERE tenant_id = ? ORDER BY event_id DESC", (tenant_id,)))
+    metrics=pd.DataFrame(_phase_rows("SELECT * FROM process_metrics WHERE tenant_id = ? ORDER BY metric_id DESC", (tenant_id,)))
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Process Events",len(events))
+    c2.metric("Processes",int(events["process_name"].nunique()) if not events.empty else 0)
+    c3.metric("Open / Pending",int(events["status"].isin(["Open","Pending","Failed"] ).sum()) if not events.empty else 0)
+    c4.metric("Bottlenecks",int((metrics["bottleneck_score"]>=65).sum()) if not metrics.empty else 0)
+    if _phase_write_allowed():
+        with st.expander("Register Process Evidence", expanded=not bool(events.empty)):
+            with st.form("process_event_form", clear_on_submit=True):
+                a,b=st.columns(2)
+                with a:
+                    process=st.text_input("Process name *", value="Field Operations")
+                    step=st.text_input("Process step", value="Execution")
+                    entity=st.text_input("Entity / partner")
+                    event_date=st.date_input("Event date", value=utc_now().date())
+                with b:
+                    volume=st.number_input("Volume", min_value=0.0, value=1.0)
+                    cycle=st.number_input("Cycle time (hours)", min_value=0.0, value=24.0)
+                    outcome=st.text_input("Outcome")
+                    status=st.selectbox("Status", ["Completed","Open","Pending","Failed","Cancelled"])
+                owner=st.text_input("Owner")
+                if st.form_submit_button("Add Process Event", use_container_width=True):
+                    if process.strip():
+                        db_execute("INSERT INTO process_events(tenant_id,process_name,process_step,event_date,entity_name,volume,cycle_time_hours,outcome,status,owner,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", (tenant_id,process.strip(),step.strip() or None,_contract_date(event_date),entity.strip() or None,float(volume),float(cycle),outcome.strip() or None,status,owner.strip() or None,utc_iso()))
+                        audit("PROCESS_EVENT_CREATED","process_event",process.strip(),{"status":status,"volume":volume})
+                        st.rerun()
+    if not events.empty:
+        agg=events.groupby("process_name",dropna=False).agg(events=("event_id","count"),volume=("volume","sum"),avg_cycle=("cycle_time_hours","mean"),failed=("status",lambda x:int((x=="Failed").sum())),pending=("status",lambda x:int(x.isin(["Open","Pending"]).sum()))).reset_index()
+        agg["failure_rate"]=(agg["failed"]/agg["events"]*100).round(2)
+        agg["backlog_rate"]=(agg["pending"]/agg["events"]*100).round(2)
+        agg["bottleneck_score"]=(agg["failure_rate"]*0.35+agg["backlog_rate"]*0.35+(agg["avg_cycle"]/max(float(agg["avg_cycle"].max()),1)*100)*0.30).clip(0,100).round(2)
+        agg["risk"] = agg["bottleneck_score"].apply(_risk_level)
+        st.subheader("Current Process Risk")
+        st.dataframe(agg, use_container_width=True, hide_index=True)
+        if _phase_write_allowed() and st.button("Persist Current Process Intelligence", use_container_width=True):
+            for _,r in agg.iterrows():
+                db_execute("INSERT INTO process_metrics(tenant_id,process_name,period_start,period_end,throughput,completion_rate,avg_cycle_time,backlog,failure_rate,bottleneck_score,risk_score,diagnosis,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (tenant_id,str(r["process_name"]),str(events["event_date"].min()),str(events["event_date"].max()),float(r["volume"]),float(max(0,100-r["failure_rate"]-r["backlog_rate"])),float(r["avg_cycle"]),float(r["pending"]),float(r["failure_rate"]),float(r["bottleneck_score"]),float(r["bottleneck_score"]),f"Primary process pressure is driven by failure/backlog/cycle-time signals; risk band {_risk_level(r['bottleneck_score'])}.",utc_iso()))
+            audit("PROCESS_INTELLIGENCE_PERSISTED","process_metrics","batch",{"processes":len(agg)})
+            st.success("Process intelligence persisted.")
+            st.rerun()
+    elif not metrics.empty:
+        st.dataframe(metrics, use_container_width=True, hide_index=True)
+    st.info("Phase 2 is evidence-first: predictive risk is derived from measurable process signals. No unsupported AI conclusion is presented as fact.")
+
+
+def phase3_knowledge_page():
+    st.title("🧠 Knowledge Graph & Governed Agents")
+    st.caption("Phase 3 · Evidence graph → governed reasoning → human approval → controlled action")
+    tenant_id=_phase_tenant()
+    entities=pd.DataFrame(_phase_rows("SELECT * FROM knowledge_entities WHERE tenant_id = ? ORDER BY knowledge_entity_id DESC", (tenant_id,)))
+    relations=pd.DataFrame(_phase_rows("SELECT * FROM knowledge_relations WHERE tenant_id = ? ORDER BY relation_id DESC", (tenant_id,)))
+    runs=pd.DataFrame(_phase_rows("SELECT * FROM agent_runs WHERE tenant_id = ? ORDER BY agent_run_id DESC", (tenant_id,)))
+    c1,c2,c3=st.columns(3)
+    c1.metric("Knowledge Entities",len(entities))
+    c2.metric("Relationships",len(relations))
+    c3.metric("Pending Agent Decisions",int((runs["approval_status"]=="Pending").sum()) if not runs.empty else 0)
+    if _phase_write_allowed():
+        tabs=st.tabs(["Graph Builder","Governed Agent"])
+        with tabs[0]:
+            with st.form("knowledge_entity_form", clear_on_submit=True):
+                a,b=st.columns(2)
+                with a:
+                    etype=st.selectbox("Entity type",["Partner","Contract","Obligation","SLA","Process","Risk","Action","Outcome","Third Party"])
+                    ekey=st.text_input("Stable entity key *")
+                with b:
+                    label=st.text_input("Label *")
+                    source=st.text_input("Source type",value="Operational evidence")
+                if st.form_submit_button("Add Knowledge Entity",use_container_width=True):
+                    if ekey.strip() and label.strip():
+                        db_execute("INSERT OR IGNORE INTO knowledge_entities(tenant_id,entity_type,entity_key,label,source_type,created_at) VALUES (?,?,?,?,?,?)",(tenant_id,etype,ekey.strip(),label.strip(),source.strip() or None,utc_iso()))
+                        audit("KNOWLEDGE_ENTITY_CREATED","knowledge_entity",ekey.strip(),{"entity_type":etype})
+                        st.rerun()
+            if not entities.empty: st.dataframe(entities,use_container_width=True,hide_index=True)
+            if len(entities)>=2:
+                opts={f"{r['label']} [{r['entity_type']}]":int(r['knowledge_entity_id']) for _,r in entities.iterrows()}
+                with st.form("knowledge_relation_form",clear_on_submit=True):
+                    a,b,c=st.columns(3)
+                    with a: frm=st.selectbox("From",list(opts),key="kg_from")
+                    with b: rel=st.selectbox("Relation",["OWNS","HAS_OBLIGATION","HAS_SLA","USES_PROCESS","AT_RISK","TRIGGERS","REQUIRES_ACTION","IMPROVES","GOVERNS"])
+                    with c: to=st.selectbox("To",list(opts),key="kg_to")
+                    if st.form_submit_button("Create Relationship",use_container_width=True) and opts[frm]!=opts[to]:
+                        db_execute("INSERT OR IGNORE INTO knowledge_relations(tenant_id,from_entity_id,relation_type,to_entity_id,source_type,created_at) VALUES (?,?,?,?,?,?)",(tenant_id,opts[frm],rel,opts[to],"Governed platform record",utc_iso()))
+                        audit("KNOWLEDGE_RELATION_CREATED","knowledge_relation",f"{opts[frm]}->{opts[to]}",{"relation":rel})
+                        st.rerun()
+        with tabs[1]:
+            objective=st.text_area("Agent objective",value="Identify the highest-priority operational control issue supported by current evidence.")
+            scope=st.selectbox("Scope",["Current tenant","Current industry","Current contract portfolio","Current TPRM register"])
+            if st.button("Run Governed Analysis",use_container_width=True):
+                evidence=[]
+                actions=[]
+                contracts=_phase_rows("SELECT contract_number,title,risk_level FROM contracts WHERE tenant_id=? AND status NOT IN ('Expired','Terminated') ORDER BY CASE risk_level WHEN 'Critical' THEN 1 WHEN 'High' THEN 2 WHEN 'Medium' THEN 3 ELSE 4 END LIMIT 5",(tenant_id,))
+                tprm=_phase_rows("SELECT e.name,a.overall_score,a.risk_level FROM tprm_entities e JOIN tprm_assessments a ON a.entity_id=e.entity_id WHERE e.tenant_id=? ORDER BY a.assessment_id DESC LIMIT 5",(tenant_id,))
+                if contracts: evidence.append(f"Contract risk records available: {len(contracts)}")
+                if tprm: evidence.append(f"Recent TPRM assessments available: {len(tprm)}")
+                if contracts and any(str(x.get("risk_level")) in ("High","Critical") for x in contracts):
+                    decision="Prioritize high-risk contractual counterparties for controlled review."
+                    actions.append("Open or refresh a contract/TPrm review with named owner and due date.")
+                    confidence=0.86
+                elif tprm and max(float(x.get("overall_score") or 0) for x in tprm)>=65:
+                    decision="Prioritize high-risk third parties for remediation."
+                    actions.append("Assign a risk-control remediation action and evidence deadline.")
+                    confidence=0.82
+                else:
+                    decision="No high-confidence critical control issue identified from the currently registered evidence."
+                    actions.append("Collect more operational/contract evidence before escalating.")
+                    confidence=0.68
+                db_execute("INSERT INTO agent_runs(tenant_id,agent_name,objective,scope,decision,evidence,recommended_action,confidence,approval_status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",(tenant_id,"Control Triage Agent",objective,scope,decision,"; ".join(evidence) or "No supporting records found."," ".join(actions),confidence,"Pending",utc_iso()))
+                audit("GOVERNED_AGENT_RUN","agent_run","Control Triage Agent",{"confidence":confidence,"scope":scope})
+                st.success("Governed analysis completed. Execution remains blocked until an authorized human approves it.")
+                st.write(decision)
+                st.caption(f"Confidence: {confidence:.0%} · Evidence: {'; '.join(evidence) or 'Insufficient registered evidence'}")
+    if not runs.empty:
+        st.subheader("Agent Governance Queue")
+        st.dataframe(runs[[c for c in ["agent_run_id","agent_name","objective","decision","recommended_action","confidence","approval_status","created_at"] if c in runs.columns]],use_container_width=True,hide_index=True)
+        pending=runs[runs["approval_status"]=="Pending"]
+        if _phase_write_allowed() and not pending.empty:
+            for _,r in pending.head(5).iterrows():
+                if st.button(f"Approve recommendation #{int(r['agent_run_id'])}",key=f"approve_agent_{int(r['agent_run_id'])}"):
+                    db_execute("UPDATE agent_runs SET approval_status='Approved',approved_by=?,approved_at=? WHERE tenant_id=? AND agent_run_id=? AND approval_status='Pending'",(st.session_state.username,utc_iso(),tenant_id,int(r['agent_run_id'])))
+                    audit("GOVERNED_AGENT_APPROVED","agent_run",int(r['agent_run_id']),{"agent":r['agent_name']})
+                    st.rerun()
+    st.warning("Governed agents in this release are deterministic control agents. They may recommend; they do not autonomously execute external actions.")
+
+
+def phase4_value_page():
+    st.title("💰 Financial Value & Scenario Simulation")
+    st.caption("Phase 4 · Driver → baseline → intervention → scenario → risk-adjusted value")
+    tenant_id=_phase_tenant()
+    drivers=pd.DataFrame(_phase_rows("SELECT * FROM value_drivers WHERE tenant_id=? ORDER BY driver_id DESC",(tenant_id,)))
+    scenarios=pd.DataFrame(_phase_rows("SELECT * FROM scenarios WHERE tenant_id=? ORDER BY scenario_id DESC",(tenant_id,)))
+    results=pd.DataFrame(_phase_rows("SELECT * FROM scenario_results WHERE tenant_id=? ORDER BY result_id DESC",(tenant_id,)))
+    total_value=float(results["risk_adjusted_value"].sum()) if not results.empty else 0
+    c1,c2,c3=st.columns(3)
+    c1.metric("Value Drivers",len(drivers))
+    c2.metric("Scenarios",len(scenarios))
+    c3.metric("Risk-Adjusted Scenario Value",_phase4_money(total_value))
+    if _phase_write_allowed():
+        tabs=st.tabs(["Value Drivers","Scenarios","Results"])
+        with tabs[0]:
+            if not drivers.empty: st.dataframe(drivers,use_container_width=True,hide_index=True)
+            with st.form("value_driver_form",clear_on_submit=True):
+                a,b=st.columns(2)
+                with a:
+                    name=st.text_input("Value driver *",value="Recovered operational value")
+                    unit=st.selectbox("Unit",["KES","USD","EUR","Units","Hours"])
+                    owner=st.text_input("Owner")
+                with b:
+                    baseline=st.number_input("Baseline",min_value=0.0,value=0.0)
+                    current=st.number_input("Current",min_value=0.0,value=0.0)
+                    target=st.number_input("Target",min_value=0.0,value=0.0)
+                    vpu=st.number_input("Value per unit",min_value=0.0,value=0.0)
+                if st.form_submit_button("Add Value Driver",use_container_width=True) and name.strip():
+                    db_execute("INSERT INTO value_drivers(tenant_id,name,unit,baseline,current_value,target_value,value_per_unit,owner,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",(tenant_id,name.strip(),unit,float(baseline),float(current),float(target),float(vpu),owner.strip() or None,utc_iso(),utc_iso()))
+                    audit("VALUE_DRIVER_CREATED","value_driver",name.strip(),{"value_per_unit":vpu})
+                    st.rerun()
+        with tabs[1]:
+            with st.form("scenario_form",clear_on_submit=True):
+                name=st.text_input("Scenario name *",value="Base Recovery Case")
+                desc=st.text_area("Description",value="Controlled improvement scenario based on measurable recovery assumptions.")
+                horizon=st.number_input("Horizon (days)",min_value=1,max_value=3650,value=90)
+                probability=st.slider("Probability",0.0,1.0,0.75,0.05)
+                if st.form_submit_button("Create Scenario",use_container_width=True) and name.strip():
+                    db_execute("INSERT INTO scenarios(tenant_id,name,description,horizon_days,probability,assumptions_json,created_by,created_at) VALUES (?,?,?,?,?,?,?,?)",(tenant_id,name.strip(),desc.strip() or None,int(horizon),float(probability),json.dumps({"governed":True}),st.session_state.username,utc_iso()))
+                    audit("SCENARIO_CREATED","scenario",name.strip(),{"probability":probability,"horizon_days":horizon})
+                    st.rerun()
+            if not scenarios.empty: st.dataframe(scenarios,use_container_width=True,hide_index=True)
+            if not scenarios.empty and not drivers.empty:
+                sc_opts={f"{r['scenario_id']} — {r['name']}":int(r['scenario_id']) for _,r in scenarios.iterrows()}
+                dr_opts={f"{r['driver_id']} — {r['name']}":int(r['driver_id']) for _,r in drivers.iterrows()}
+                with st.form("scenario_result_form",clear_on_submit=True):
+                    sc=st.selectbox("Scenario",list(sc_opts))
+                    dr=st.selectbox("Value driver",list(dr_opts))
+                    baseline=st.number_input("Scenario baseline",min_value=0.0,value=0.0)
+                    scenario_value=st.number_input("Scenario value",min_value=0.0,value=0.0)
+                    notes=st.text_area("Assumption / evidence note")
+                    if st.form_submit_button("Calculate & Store Scenario",use_container_width=True):
+                        sr=scenarios[scenarios["scenario_id"]==sc_opts[sc]].iloc[0]
+                        gross=max(0.0,float(scenario_value)-float(baseline))
+                        risk_adj=gross*float(sr.get("probability") or 0)
+                        db_execute("INSERT INTO scenario_results(tenant_id,scenario_id,driver_id,baseline_value,scenario_value,gross_value,risk_adjusted_value,notes,created_at) VALUES (?,?,?,?,?,?,?,?,?)",(tenant_id,sc_opts[sc],dr_opts[dr],float(baseline),float(scenario_value),gross,risk_adj,notes.strip() or None,utc_iso()))
+                        audit("SCENARIO_CALCULATED","scenario_result",sc_opts[sc],{"gross_value":gross,"risk_adjusted_value":risk_adj})
+                        st.rerun()
+        with tabs[2]:
+            if not results.empty: st.dataframe(results,use_container_width=True,hide_index=True)
+    st.info("Financial scenarios are decision-support models. Value is calculated from explicit assumptions and probability; it is not presented as guaranteed revenue or savings.")
+
 
 
 def _contract_scope_clause():
@@ -3635,6 +4160,10 @@ if st.session_state.access_mode == "customer":
         "Commercial Value",
         "Customer Report",
         "Export",
+        "Third-Party Risk",
+        "Process Intelligence",
+        "Knowledge & Agents",
+        "Value & Scenarios",
     ]
     if not module_enabled(st.session_state.get("tenant_id"), "partner_performance"):
         page_options = []
@@ -3656,10 +4185,14 @@ else:
         "Commercial Value",
         "Customer Report",
         "Export",
+        "Third-Party Risk",
+        "Process Intelligence",
+        "Knowledge & Agents",
+        "Value & Scenarios",
         "Administration",
     ]
     if not module_enabled(st.session_state.get("tenant_id"), "partner_performance"):
-        page_options = [p for p in page_options if p in ("Administration", "Contract Management")]
+        page_options = [p for p in page_options if p in ("Administration", "Contract Management", "Third-Party Risk", "Process Intelligence", "Knowledge & Agents", "Value & Scenarios")]
     if module_enabled(st.session_state.get("tenant_id"), "contract_intelligence"):
         page_options.insert(-1, "Contract Management")
 
@@ -4030,6 +4563,26 @@ def ingestion_summary(
 # ============================================================
 # 27. LOAD + PROCESS DATA
 # ============================================================
+
+# Phase 1-4 workspaces are independently operable and therefore do not pass
+# through the legacy operational-data quality gate. This preserves the CMS
+# independence model while allowing the new control modules to operate with
+# their own evidence stores.
+if page == "Third-Party Risk":
+    phase1_tprm_page()
+    st.stop()
+
+if page == "Process Intelligence":
+    phase2_process_page()
+    st.stop()
+
+if page == "Knowledge & Agents":
+    phase3_knowledge_page()
+    st.stop()
+
+if page == "Value & Scenarios":
+    phase4_value_page()
+    st.stop()
 
 if page == "Contract Management":
     # CMS is independently operable. It must not require an operational
@@ -6453,7 +7006,7 @@ if page != "Administration":
 st.sidebar.divider()
 
 st.sidebar.caption(
-    "PartnerOps 5.0 Commercial Control"
+    "PartnerOps 5.5 Phase 1-4 Control Platform"
 )
 
 st.sidebar.caption(
