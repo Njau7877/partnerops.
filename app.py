@@ -1205,9 +1205,20 @@ init_phase_roadmap_db()
 
 
 def ensure_schema_metadata():
-    """Persist the application schema revision for deployment diagnostics."""
-    db_execute("CREATE TABLE IF NOT EXISTS platform_metadata (metadata_key TEXT PRIMARY KEY, metadata_value TEXT NOT NULL, updated_at TEXT NOT NULL)")
-    db_execute("INSERT OR REPLACE INTO platform_metadata(metadata_key, metadata_value, updated_at) VALUES (?, ?, ?)", ("schema_version", SCHEMA_VERSION, utc_iso()))
+    """Persist the application schema revision for deployment diagnostics.
+
+    This function runs during startup, before the later security/time helper
+    section is defined. Use a local UTC timestamp here so startup never
+    depends on a function declared later in the module.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    db_execute(
+        "CREATE TABLE IF NOT EXISTS platform_metadata (metadata_key TEXT PRIMARY KEY, metadata_value TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    db_execute(
+        "INSERT OR REPLACE INTO platform_metadata(metadata_key, metadata_value, updated_at) VALUES (?, ?, ?)",
+        ("schema_version", SCHEMA_VERSION, timestamp),
+    )
 
 
 ensure_schema_metadata()
