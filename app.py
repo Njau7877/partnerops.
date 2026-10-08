@@ -112,7 +112,7 @@ except Exception:
 # ============================================================
 
 PLATFORM_NAME = "PartnerOps"
-APP_VERSION = "5.5.3 Startup & Runtime Hardened"
+APP_VERSION = "5.5.2 Nine-Environment Validation & Runtime Hardened"
 
 
 def get_config_value(name, default=None):
@@ -175,9 +175,6 @@ MAX_UPLOAD_COLUMNS = max(20, min(MAX_UPLOAD_COLUMNS, 500))
 MAX_UPLOAD_CELLS = min(MAX_UPLOAD_ROWS * MAX_UPLOAD_COLUMNS, 10_000_000)
 MAX_DATASET_INSERT_BATCH = 1000
 ANALYSIS_CACHE_TTL_SECONDS = 900
-DB_BUSY_RETRY_COUNT = 4
-DB_BUSY_RETRY_SLEEP_SECONDS = 0.25
-SCHEMA_VERSION = "5.5.2"
 MAX_ZIP_MEMBERS = 5000
 MAX_ZIP_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 MAX_IMAGE_PIXELS = 50_000_000
@@ -553,72 +550,38 @@ def has_permission(permission):
 # ============================================================
 
 def get_db():
-    """Open a resilient SQLite connection with safe runtime defaults."""
-    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False, isolation_level=None)
+    """Open a resilient SQLite connection for Streamlit Cloud and local use."""
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA temp_store = MEMORY")
     if DB_FILE != ":memory:":
         try:
             conn.execute("PRAGMA journal_mode = WAL")
         except sqlite3.DatabaseError:
+            # WAL may be unavailable on unusual filesystems; normal SQLite mode
+            # remains functional for the pilot application.
             pass
     return conn
 
 
 def db_execute(sql, params=(), fetch=False, many=False):
-    """Execute a DB operation transactionally and retry transient SQLite locks."""
-    last_error = None
-    import time
-    for attempt in range(DB_BUSY_RETRY_COUNT):
-        conn = get_db()
-        try:
-            cur = conn.cursor()
-            cur.execute("BEGIN")
-            if many:
-                cur.executemany(sql, params)
-            else:
-                cur.execute(sql, params)
-            result = cur.fetchall() if fetch else None
-            conn.commit()
-            return result
-        except sqlite3.OperationalError as exc:
-            try: conn.rollback()
-            except sqlite3.DatabaseError: pass
-            last_error = exc
-            message = str(exc).lower()
-            if "locked" not in message and "busy" not in message:
-                raise
-            if attempt + 1 >= DB_BUSY_RETRY_COUNT:
-                raise
-            time.sleep(DB_BUSY_RETRY_SLEEP_SECONDS * (attempt + 1))
-        except Exception:
-            try: conn.rollback()
-            except sqlite3.DatabaseError: pass
-            raise
-        finally:
-            conn.close()
-    raise last_error
-
-
-def database_runtime_check():
-    """Verify DB connectivity/integrity without exposing secrets or customer data."""
-    result = {"connection": False, "foreign_keys": False, "integrity": False, "schema_tables": False, "journal_mode": "unknown"}
-    conn = None
+    conn = get_db()
+    cur = conn.cursor()
     try:
-        conn = get_db()
-        result["connection"] = True
-        result["foreign_keys"] = int(conn.execute("PRAGMA foreign_keys").fetchone()[0]) == 1
-        result["journal_mode"] = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-        result["integrity"] = str(conn.execute("PRAGMA integrity_check").fetchone()[0]).lower() == "ok"
-        result["schema_tables"] = int(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]) > 0
-    except Exception as exc:
-        result["error"] = type(exc).__name__
+        if many:
+            cur.executemany(sql, params)
+        else:
+            cur.execute(sql, params)
+        result = cur.fetchall() if fetch else None
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        if conn is not None: conn.close()
-    return result
+        conn.close()
 
 
 def init_db():
@@ -766,6 +729,9 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+init_db()
 
 
 # ============================================================
@@ -946,6 +912,9 @@ def module_enabled(tenant_id, module_key):
 # Initialize the contract-intelligence schema before any module entitlement
 # queries or default-module seeding. This is required on a fresh deployment
 # as well as on an upgraded 5.2.x database.
+init_contract_db()
+
+
 def ensure_default_modules():
     """Ensure module-entitlement storage exists before seeding tenant defaults.
 
@@ -982,6 +951,9 @@ def ensure_default_modules():
         ],
         many=True,
     )
+
+
+ensure_default_modules()
 
 
 # ============================================================
@@ -1192,21 +1164,7 @@ def init_phase_roadmap_db():
     conn.close()
 
 
-def ensure_schema_metadata():
-    """Persist the application schema revision for deployment diagnostics.
-
-    This function runs during startup, before the later security/time helper
-    section is defined. Use a local UTC timestamp here so startup never
-    depends on a function declared later in the module.
-    """
-    timestamp = datetime.now(timezone.utc).isoformat()
-    db_execute(
-        "CREATE TABLE IF NOT EXISTS platform_metadata (metadata_key TEXT PRIMARY KEY, metadata_value TEXT NOT NULL, updated_at TEXT NOT NULL)"
-    )
-    db_execute(
-        "INSERT OR REPLACE INTO platform_metadata(metadata_key, metadata_value, updated_at) VALUES (?, ?, ?)",
-        ("schema_version", SCHEMA_VERSION, timestamp),
-    )
+init_phase_roadmap_db()
 
 
 def _phase_rows(sql, params=()):
@@ -1985,70 +1943,7 @@ def seed_data():
         )
 
 
-@st.cache_resource(show_spinner=False)
-def bootstrap_database():
-    """Initialize the complete database exactly once per Streamlit process.
-
-    The previous 5.5.2 implementation initialized several schema layers while
-    Python was still importing the module. That made Cloud startup sensitive to
-    definition order and caused repeated schema work on Streamlit reruns.
-    5.5.3 performs the same initialization after all required functions are
-    defined and caches the completed bootstrap for the lifetime of the process.
-    """
-    import time
-
-    started = time.perf_counter()
-    print(f"[PartnerOps] startup: bootstrap begin | version={APP_VERSION}", flush=True)
-
-    stages = (
-        ("core_schema", init_db),
-        ("contract_schema", init_contract_db),
-        ("phase_1_4_schema", init_phase_roadmap_db),
-        ("schema_metadata", ensure_schema_metadata),
-        ("seed_data", seed_data),
-        ("module_entitlements", ensure_default_modules),
-    )
-
-    for stage_name, stage_fn in stages:
-        stage_started = time.perf_counter()
-        print(f"[PartnerOps] startup: {stage_name} begin", flush=True)
-        try:
-            stage_fn()
-        except Exception:
-            logger.exception("PartnerOps startup failed during stage=%s", stage_name)
-            print(f"[PartnerOps] startup: {stage_name} FAILED", flush=True)
-            raise
-        elapsed = time.perf_counter() - stage_started
-        print(f"[PartnerOps] startup: {stage_name} complete | {elapsed:.2f}s", flush=True)
-
-    health = database_runtime_check()
-    print(
-        "[PartnerOps] startup: database health | "
-        f"connection={health.get('connection')} "
-        f"integrity={health.get('integrity')} "
-        f"foreign_keys={health.get('foreign_keys')} "
-        f"journal={health.get('journal_mode')}",
-        flush=True,
-    )
-
-    if not (health.get("connection") and health.get("integrity") and health.get("foreign_keys")):
-        logger.critical("PartnerOps database runtime check failed: %s", health)
-        raise RuntimeError("PartnerOps database integrity validation failed during startup.")
-
-    elapsed = time.perf_counter() - started
-    print(f"[PartnerOps] startup: bootstrap complete | {elapsed:.2f}s", flush=True)
-    return health
-
-
-try:
-    RUNTIME_HEALTH = bootstrap_database()
-except Exception as startup_exc:
-    logger.exception("PartnerOps startup aborted safely: %s", type(startup_exc).__name__)
-    st.error(
-        "PartnerOps could not complete its startup validation. "
-        "The application has been stopped safely. Check the deployment logs for the startup stage that failed."
-    )
-    st.stop()
+seed_data()
 
 
 # ============================================================
@@ -3750,6 +3645,60 @@ def demo_logistics():
     )
 
 
+def demo_industry(industry):
+    """Deterministic validation dataset for every configured PartnerOps environment.
+
+    These are synthetic records used only to prove that each environment has
+    usable inputs for its configured primary KPI and supporting weighted KPIs.
+    They are intentionally not presented as customer or production data.
+    """
+    cfg = INDUSTRIES[industry]
+    primary = cfg["primary_kpi"]
+
+    # Primary KPI values deliberately span healthy, watch and at-risk cases.
+    primary_values = {
+        "Telecom / ISP / OSP": [96, 84, 68, 45],
+        "Logistics / Delivery": [97, 86, 72, 54],
+        "Field Service / Contractors": [95, 83, 69, 48],
+        "Distribution / FMCG": [98, 88, 74, 52],
+        "Banking / Fintech / Agents": [99, 93, 81, 62],
+        "Energy / Utilities": [96, 85, 70, 49],
+        "Insurance": [95, 84, 68, 50],
+        "Construction": [93, 82, 67, 46],
+        "Healthcare": [97, 86, 71, 51],
+    }[industry]
+
+    names = [
+        f"{industry.split(' / ')[0]} Alpha",
+        f"{industry.split(' / ')[0]} Beta",
+        f"{industry.split(' / ')[0]} Gamma",
+        f"{industry.split(' / ')[0]} Delta",
+    ]
+
+    rows = []
+    for i, value in enumerate(primary_values):
+        row = {
+            "partner": names[i],
+            "date": f"2026-10-{i + 1:02d}",
+            "output": [1100, 900, 700, 500][i],
+            "completed": [1040, 740, 500, 280][i],
+            "pending": [35, 160, 240, 310][i],
+            "productivity": [96, 84, 71, 58][i],
+            "quality": [97, 88, 76, 63][i],
+            "delivery_rate": [96, 84, 70, 52][i],
+            "completion_rate": [96, 83, 69, 48][i],
+            "success_rate": [99, 93, 81, 62][i],
+            "fulfillment_rate": [98, 88, 74, 52][i],
+            "failure_rate": [2, 7, 14, 24][i],
+            "backlog": [20, 90, 180, 260][i],
+            "aging": [2, 6, 12, 21][i],
+        }
+        row[primary] = value
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def get_demo_data(industry):
     if industry == "Telecom / ISP / OSP":
         return demo_telecom()
@@ -3757,7 +3706,12 @@ def get_demo_data(industry):
     if industry == "Logistics / Delivery":
         return demo_logistics()
 
-    return demo_telecom()
+    # Every remaining environment receives its own deterministic synthetic
+    # dataset rather than silently falling back to telecom records.
+    if industry in INDUSTRIES:
+        return demo_industry(industry)
+
+    raise ValueError(f"Unsupported PartnerOps industry: {industry}")
 
 
 # ============================================================
@@ -7159,18 +7113,6 @@ elif page == "Administration":
                 {
                     "Control": "Access Link Expiry",
                     "Value": "Enabled",
-                },
-                {
-                    "Control": "Database Integrity",
-                    "Value": "PASS" if RUNTIME_HEALTH.get("integrity") else "FAIL",
-                },
-                {
-                    "Control": "SQLite Journal",
-                    "Value": RUNTIME_HEALTH.get("journal_mode", "unknown"),
-                },
-                {
-                    "Control": "Schema Version",
-                    "Value": SCHEMA_VERSION,
                 },
             ]
         )
